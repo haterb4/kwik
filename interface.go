@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/s-anzie/kwik/internal/protocol"
+	"github.com/s-anzie/kwik/internal/transport"
 )
 
 // Stream represents a KWIK stream
@@ -78,4 +79,5 @@ type Listener interface {
 type streamManager interface {
 	GetNextStreamID() protocol.StreamID
 	CreateStream() Stream
+	AddStreamPath(streamID protocol.StreamID, path transport.Path) error
 }

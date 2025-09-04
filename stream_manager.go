@@ -6,6 +6,7 @@ import (
 
 	"github.com/s-anzie/kwik/internal/logger"
 	"github.com/s-anzie/kwik/internal/protocol"
+	"github.com/s-anzie/kwik/internal/transport"
 )
 
 type streamManagerImpl struct {
@@ -30,9 +31,18 @@ func (mg *streamManagerImpl) CreateStream() Stream {
 	id := atomic.AddUint64(&mg.nextStreamID, 1)
 	stream := NewStream(protocol.StreamID(id))
 	mg.streams[protocol.StreamID(id)] = stream
-	mg.nextStreamID = id
 	return stream
 }
 func (mg *streamManagerImpl) GetNextStreamID() protocol.StreamID {
 	return protocol.StreamID(atomic.AddUint64(&mg.nextStreamID, 1))
+}
+func (mg *streamManagerImpl) AddStreamPath(streamID protocol.StreamID, path transport.Path) error {
+	mg.mu.Lock()
+	stream, ok := mg.streams[streamID]
+	mg.mu.Unlock()
+	if !ok {
+		return protocol.NewNotExistStreamError(path.PathID(), streamID)
+	}
+	// Delegate path management to StreamImpl
+	return stream.AddPath(path)
 }

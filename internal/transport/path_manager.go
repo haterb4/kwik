@@ -53,6 +53,8 @@ func (pm *pathManagerImpl) OpenPath(ctx context.Context, address string) (protoc
 		return 0, protocol.NewPathNotExistsError(nextPathID)
 	}
 	path := NewPath(nextPathID, conn)
+	// mark outbound dialed paths as client-side
+	path.isClient = true
 	pm.paths[nextPathID] = path
 	pm.nextPathID = uint64(nextPathID)
 	return nextPathID, nil
@@ -64,6 +66,8 @@ func (pm *pathManagerImpl) AccpetPath(conn *quic.Conn) (protocol.PathID, error) 
 		return 0, protocol.NewPathNotExistsError(nextPathID)
 	}
 	path := NewPath(nextPathID, conn)
+	// mark accepted paths as server-side (isClient=false)
+	path.isClient = false
 	pm.paths[nextPathID] = path
 	pm.nextPathID = uint64(nextPathID)
 	return nextPathID, nil

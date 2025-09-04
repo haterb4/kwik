@@ -32,6 +32,18 @@ func NewServerSession(id protocol.SessionID, conn *quic.Conn) *ServerSession {
 		panic(err)
 	}
 	pathMgr.SetPrimaryPath(pathid)
+	// ensure default packer/multiplexer exist for this process
+	if transport.GetDefaultPacker() == nil {
+		pk := transport.NewPacker(1200)
+		transport.SetDefaultPacker(pk)
+		// start retransmit loop
+		pk.StartRetransmitLoop(nil)
+	}
+	if transport.GetDefaultMultiplexer() == nil {
+		mx := transport.NewMultiplexer()
+		transport.SetDefaultMultiplexer(mx)
+		mx.StartAckLoop(200)
+	}
 	return &ServerSession{
 		id:         id,
 		pathMgr:    pathMgr,
@@ -82,6 +94,7 @@ func (s *ServerSession) AcceptStream(ctx context.Context) (Stream, error) {
 		return nil, err
 	}
 	streamImpl := s.streamMgr.CreateStream()
+	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
 	return streamImpl, nil
 }
 
@@ -95,6 +108,7 @@ func (s *ServerSession) OpenStreamSync(ctx context.Context) (Stream, error) {
 		return nil, err
 	}
 	streamImpl := s.streamMgr.CreateStream()
+	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
 	return streamImpl, nil
 }
 
@@ -108,6 +122,7 @@ func (s *ServerSession) OpenStream() (Stream, error) {
 		return nil, err
 	}
 	streamImpl := s.streamMgr.CreateStream()
+	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
 	return streamImpl, nil
 }
 

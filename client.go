@@ -70,6 +70,17 @@ func (s *ClientSession) connect(ctx context.Context) error {
 		return protocol.NewInvalidPathIDError(id)
 	}
 	s.pathMgr.SetPrimaryPath(id)
+	// ensure default packer/multiplexer exist for this process
+	if transport.GetDefaultPacker() == nil {
+		pk := transport.NewPacker(1200)
+		transport.SetDefaultPacker(pk)
+		pk.StartRetransmitLoop(nil)
+	}
+	if transport.GetDefaultMultiplexer() == nil {
+		mx := transport.NewMultiplexer()
+		transport.SetDefaultMultiplexer(mx)
+		mx.StartAckLoop(200)
+	}
 	return nil
 }
 
@@ -82,8 +93,16 @@ func (s *ClientSession) RemoteAddr() string {
 }
 
 func (s *ClientSession) AcceptStream(ctx context.Context) (Stream, error) {
-	// Not yet implemented - return a new stream
-	streamImpl := NewStream(protocol.StreamID(1))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	id := s.streamMgr.GetNextStreamID()
+	err := s.pathMgr.GetPrimaryPath().AcceptStream(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	streamImpl := s.streamMgr.CreateStream()
+	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
 	return streamImpl, nil
 }
 
@@ -96,6 +115,7 @@ func (s *ClientSession) OpenStreamSync(ctx context.Context) (Stream, error) {
 		return nil, err
 	}
 	streamImpl := s.streamMgr.CreateStream()
+	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
 	return streamImpl, nil
 }
 
@@ -109,6 +129,7 @@ func (s *ClientSession) OpenStream() (Stream, error) {
 		return nil, err
 	}
 	streamImpl := s.streamMgr.CreateStream()
+	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
 	return streamImpl, nil
 }
 
