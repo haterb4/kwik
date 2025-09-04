@@ -2,7 +2,6 @@ package kwik
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"github.com/s-anzie/kwik/internal/logger"
 	"github.com/s-anzie/kwik/internal/protocol"
@@ -10,39 +9,123 @@ import (
 )
 
 type streamManagerImpl struct {
+	mu           sync.RWMutex
 	streams      map[protocol.StreamID]*StreamImpl
-	nextStreamID uint64
-	mu           sync.Mutex
+	nextStreamID protocol.StreamID
 	logger       logger.Logger
 }
 
 func NewStreamManager() *streamManagerImpl {
 	return &streamManagerImpl{
 		streams:      make(map[protocol.StreamID]*StreamImpl),
-		nextStreamID: 0,
-		logger:       logger.NewLogger(logger.LogLevelDebug).WithComponent("STEAM_MANAGER_IMPL"),
+		nextStreamID: 1,
+		logger:       logger.NewLogger(logger.LogLevelDebug).WithComponent("STREAM_MANAGER"),
 	}
 }
 
-func (mg *streamManagerImpl) CreateStream() Stream {
-	mg.mu.Lock()
-	defer mg.mu.Unlock()
+func (m *streamManagerImpl) CreateStream() Stream {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	id := atomic.AddUint64(&mg.nextStreamID, 1)
-	stream := NewStream(protocol.StreamID(id))
-	mg.streams[protocol.StreamID(id)] = stream
+	streamID := m.nextStreamID
+	m.nextStreamID++
+
+	stream := &StreamImpl{
+		id:            streamID,
+		paths:         make(map[protocol.PathID]transport.Path),
+		logger:        m.logger,
+		streamManager: m,
+	}
+
+	m.streams[streamID] = stream
+	m.logger.Debug("Created new stream", "streamID", streamID)
 	return stream
 }
-func (mg *streamManagerImpl) GetNextStreamID() protocol.StreamID {
-	return protocol.StreamID(atomic.AddUint64(&mg.nextStreamID, 1))
+
+func (m *streamManagerImpl) GetNextStreamID() protocol.StreamID {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.nextStreamID
 }
-func (mg *streamManagerImpl) AddStreamPath(streamID protocol.StreamID, path transport.Path) error {
-	mg.mu.Lock()
-	stream, ok := mg.streams[streamID]
-	mg.mu.Unlock()
-	if !ok {
-		return protocol.NewNotExistStreamError(path.PathID(), streamID)
+
+func (m *streamManagerImpl) AddStreamPath(streamID protocol.StreamID, path transport.Path) error {
+	if path == nil {
+		return protocol.NewPathNotExistsError(0)
 	}
-	// Delegate path management to StreamImpl
-	return stream.AddPath(path)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Get or create the stream
+	stream, exists := m.streams[streamID]
+	if !exists {
+		// Create a new stream with this ID
+		stream = &StreamImpl{
+			id:            streamID,
+			paths:         make(map[protocol.PathID]transport.Path),
+			logger:        m.logger,
+			streamManager: m,
+		}
+		stream.paths[path.PathID()] = path
+		m.streams[streamID] = stream
+	} else {
+		// Check if the path is already added to this stream
+		if _, exists := stream.paths[path.PathID()]; exists {
+			return protocol.NewExistStreamError(path.PathID(), streamID)
+		}
+		// Add the path to the existing stream
+		paths := len(stream.paths)
+		stream.paths[path.PathID()] = path
+		if paths == 0 {
+			stream.primaryPathID = path.PathID()
+		}
+	}
+
+	// Update the next stream ID if needed
+	if streamID >= m.nextStreamID {
+		m.nextStreamID = streamID + 1
+	}
+
+	m.logger.Debug("Added path to stream",
+		"streamID", streamID,
+		"pathID", path.PathID(),
+		"totalPaths", len(stream.paths))
+
+	return nil
+}
+
+// addStream adds a stream to the manager's internal map without locking.
+// Caller must hold the mutex.
+func (m *streamManagerImpl) addStream(stream *StreamImpl) {
+	m.streams[stream.id] = stream
+	if stream.id >= m.nextStreamID {
+		m.nextStreamID = stream.id + 1
+	}
+	m.logger.Debug("Added stream", "streamID", stream.id)
+}
+
+func (m *streamManagerImpl) RemoveStream(streamID protocol.StreamID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.streams[streamID]; exists {
+		delete(m.streams, streamID)
+		m.logger.Debug("Removed stream", "streamID", streamID)
+	}
+}
+
+func (m *streamManagerImpl) GetStream(streamID protocol.StreamID) (Stream, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	stream, ok := m.streams[streamID]
+	return stream, ok
+}
+
+func (mg *streamManagerImpl) CloseAllStreams() {
+	mg.mu.Lock()
+	defer mg.mu.Unlock()
+	for _, stream := range mg.streams {
+		stream.Close()
+	}
 }

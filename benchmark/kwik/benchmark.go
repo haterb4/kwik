@@ -405,7 +405,7 @@ func main() {
 		StreamCounts:     []int{1, 5, 10, 20},                                                  // Nombre de streams par connexion
 		ConnectionCounts: []int{1, 5, 10, 25},                                                  // Nombre de connexions simultanées
 		Duration:         10 * time.Second,                                                     // Durée de chaque test
-		ServerAddr:       "localhost:4243",
+		ServerAddr:       "localhost:4242",
 	}
 
 	runner := NewBenchmarkRunner(config)

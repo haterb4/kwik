@@ -26,9 +26,10 @@ type path struct {
 	// role: true if this path was created by a client (active dial), false if accepted by server
 	isClient bool
 	// handshake / session state
-	sessionMu       sync.Mutex
-	sessionReady    bool
-	handshakeRespCh chan *protocol.Frame
+	sessionMu            sync.Mutex
+	sessionReady         bool
+	handshakeRespCh      chan *protocol.Frame
+	lastAcceptedStreamID protocol.StreamID // tracks the last accepted stream ID
 	// health check
 	healthIntervalMs  int
 	healthLoopStarted int32 // atomic bool to prevent multiple health loops
@@ -44,36 +45,27 @@ type path struct {
 	controlMu       sync.Mutex
 	controlReady    chan struct{}
 	controlCreating bool
+	session         Session
 }
 
-func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool) *path {
+func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool, session Session) *path {
 	path := path{
-		id:                  id,
-		conn:                conn,
-		isClient:            isClient,
-		streams:             make(map[protocol.StreamID]*quic.Stream),
-		logger:              logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH"),
-		healthIntervalMs:    1000,
-		healthy:             1,
-		missedPongThreshold: 3,
+		id:                   id,
+		conn:                 conn,
+		isClient:             isClient,
+		streams:              make(map[protocol.StreamID]*quic.Stream),
+		logger:               logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH"),
+		healthIntervalMs:     1000,
+		healthy:              1,
+		missedPongThreshold:  3,
+		lastAcceptedStreamID: 1,
+		session:              session,
 	}
 	// Initialize control stream readiness channel
 	path.controlReady = make(chan struct{})
 
-	// Ensure default packer/multiplexer exist
-	if GetDefaultPacker() == nil {
-		pk := NewPacker(1200)
-		SetDefaultPacker(pk)
-		pk.StartRetransmitLoop(nil)
-	}
-	if GetDefaultMultiplexer() == nil {
-		mx := NewMultiplexer()
-		SetDefaultMultiplexer(mx)
-		mx.StartAckLoop(1000) // Less frequent ACK loop for better performance
-	}
-
 	// Register the path immediately so it can receive control frames
-	GetDefaultPacker().RegisterPath(&path)
+	path.session.Packer().RegisterPath(&path)
 
 	// Opening or accepting the control stream here and perform the handshake here before returning the path.
 	if isClient {
@@ -121,6 +113,11 @@ func (p *path) PathID() protocol.PathID {
 // IsClient returns true if this path was created by a client dialing out.
 func (p *path) IsClient() bool {
 	return p.isClient
+}
+func (p *path) RemoveStream(streamID protocol.StreamID) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.streams, streamID)
 }
 
 // IsSessionReady reports whether the handshake/session is established.
@@ -178,19 +175,34 @@ func (p *path) OpenStream(streamID protocol.StreamID) error {
 }
 func (p *path) AcceptStream(ctx context.Context, streamID protocol.StreamID) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.logger.Debug("Waiting for New Quic Stream on path: ", p.id)
+	// We don't defer unlock here because we need to unlock before starting the reader
+	// to avoid potential deadlocks in the reader goroutine
+
+	p.logger.Debug("Waiting for new QUIC stream on path", "pathID", p.id)
 	stream, err := p.conn.AcceptStream(ctx)
 	if err != nil {
+		p.mu.Unlock()
 		return err
 	}
-	p.logger.Debug("Accepted New Quic Stream ", stream.StreamID(), " for stream ", streamID, " on path ", p.id)
+
+	// Use the actual stream ID from QUIC if the provided streamID is 0 (for server-side)
+
+	p.logger.Debug("Accepted new QUIC stream",
+		"pathID", p.id,
+		"quicStreamID", stream.StreamID(),
+		"logicalStreamID", streamID)
 
 	if _, ok := p.streams[streamID]; ok {
+		p.mu.Unlock()
+		stream.Close()
 		return protocol.NewExistStreamError(p.id, streamID)
 	}
+
 	p.streams[streamID] = stream
-	// start reader goroutine to forward length-prefixed packets to multiplexer
+	p.lastAcceptedStreamID = streamID // Update last accepted stream ID
+	p.mu.Unlock()                     // Unlock before starting the reader goroutine
+
+	// Start reader goroutine to forward length-prefixed packets to multiplexer
 	go p.runStreamReader(streamID, stream)
 	return nil
 }
@@ -220,7 +232,7 @@ func (p *path) runStreamReader(streamID protocol.StreamID, s *quic.Stream) {
 		if streamID == protocol.StreamID(0) && p.logger != nil {
 			p.logger.Debug("control stream packet received", "path", p.id, "stream", streamID, "seq", packetSeq, "len", l)
 		}
-		if mx := GetDefaultMultiplexer(); mx != nil {
+		if mx := p.session.Multiplexer(); mx != nil {
 			_ = mx.PushPacketWithSeq(p.id, packetSeq, buf)
 		}
 	}
@@ -445,6 +457,7 @@ func (p *path) startHealthLoop() {
 
 // HandleControlFrame processes inbound control frames received for this path.
 func (p *path) HandleControlFrame(f *protocol.Frame) error {
+	// p.logger.Debug("HandleControlFrame called", "path", p.id, "isClient", p.isClient, "frameType", f.Type)
 	switch f.Type {
 	case protocol.FrameTypePing:
 		// reply with Pong
@@ -485,21 +498,6 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 		default:
 			p.logger.Debug("handshake response channel full or not ready", "path", p.id)
 		}
-		// additionally if we have an expected nonce, validate it
-		p.sessionMu.Lock()
-		expected := p.expectedHandshakeNonce
-		if expected != nil && len(expected) == len(f.Payload) && bytes.Equal(expected, f.Payload) {
-			p.sessionReady = true
-			p.expectedHandshakeNonce = nil
-			p.sessionMu.Unlock()
-			p.logger.Debug("path sessionReady set via handshake response", "path", p.id, "isClient", p.isClient)
-			p.logger.Info("handshake validated via response", "path", p.id, "nonce", hex.EncodeToString(f.Payload))
-			// start health loop now that session is established
-			go p.startHealthLoop()
-			return nil
-		}
-		p.sessionMu.Unlock()
-		p.logger.Warn("received unexpected handshake response", "path", p.id, "expected", hex.EncodeToString(expected), "got", hex.EncodeToString(f.Payload))
 		return nil
 	default:
 		p.logger.Debug("unknown control frame", "type", f.Type)
@@ -539,4 +537,38 @@ func (p *path) WriteStream(streamID protocol.StreamID, b []byte) (int, error) {
 		return 0, protocol.NewNotExistStreamError(p.id, streamID)
 	}
 	return s.Write(b)
+}
+
+// HasStream checks if a stream with the given ID exists in this path
+func (p *path) HasStream(streamID protocol.StreamID) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, exists := p.streams[streamID]
+	return exists
+}
+
+func (p *path) CloseStream(streamID protocol.StreamID) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	stream, ok := p.streams[streamID]
+	if !ok {
+		return protocol.NewNotExistStreamError(p.id, streamID)
+	}
+	delete(p.streams, streamID)
+	return stream.Close()
+}
+
+func (p *path) Close() error {
+	return p.conn.CloseWithError(0, "path closed")
+}
+
+func (p *path) Session() Session {
+	return p.session
+}
+
+// GetLastAcceptedStreamID returns the ID of the last accepted stream
+func (p *path) GetLastAcceptedStreamID() protocol.StreamID {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastAcceptedStreamID
 }

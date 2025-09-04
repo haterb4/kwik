@@ -3,6 +3,7 @@ package kwik
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"sync"
 
 	"github.com/quic-go/quic-go"
@@ -13,36 +14,51 @@ import (
 )
 
 type ServerSession struct {
-	id         protocol.SessionID
-	localAddr  string
-	remoteAddr string
-	mu         sync.Mutex
-	pathMgr    transport.PathManager
-	streamMgr  streamManager
-	logger     logger.Logger
+	id          protocol.SessionID
+	localAddr   string
+	remoteAddr  string
+	mu          sync.Mutex
+	pathMgr     transport.PathManager
+	streamMgr   *streamManagerImpl
+	logger      logger.Logger
+	packer      *transport.Packer
+	multiplexer *transport.Multiplexer
 }
 
 // Ensure ServerSession implements Session
 var _ Session = (*ServerSession)(nil)
 
 func NewServerSession(id protocol.SessionID, conn *quic.Conn) *ServerSession {
-	lg := logger.NewLogger(logger.LogLevelDebug).WithComponent("SERVER_SESSION_FACTORY")
+	lg := logger.NewLogger(logger.LogLevelSilent).WithComponent("SERVER_SESSION_FACTORY")
 	lg.Debug("Creating new ServerSession...")
 	pathMgr := transport.NewServerPathManager()
-	pathid, err := pathMgr.AccpetPath(conn)
+	packer := transport.NewPacker(1200)
+	multiplexer := transport.NewMultiplexer(packer)
+	sess := &ServerSession{
+		id:          id,
+		pathMgr:     pathMgr,
+		streamMgr:   NewStreamManager(),
+		localAddr:   conn.LocalAddr().String(),
+		remoteAddr:  conn.RemoteAddr().String(),
+		logger:      logger.NewLogger(logger.LogLevelSilent).WithComponent("SERVER_SESSION"),
+		packer:      packer,
+		multiplexer: multiplexer,
+	}
+	pathid, err := pathMgr.AccpetPath(conn, sess)
 	if err != nil {
 		panic(err)
 	}
 	pathMgr.SetPrimaryPath(pathid)
 
-	return &ServerSession{
-		id:         id,
-		pathMgr:    pathMgr,
-		streamMgr:  NewStreamManager(),
-		localAddr:  conn.LocalAddr().String(),
-		remoteAddr: conn.RemoteAddr().String(),
-		logger:     logger.NewLogger(logger.LogLevelDebug).WithComponent("SERVER_SESSION"),
-	}
+	return sess
+}
+
+func (s *ServerSession) Packer() *transport.Packer {
+	return s.packer
+}
+
+func (s *ServerSession) Multiplexer() *transport.Multiplexer {
+	return s.multiplexer
 }
 
 // listen on the given address with the given TLS and KWIK configurations
@@ -77,29 +93,76 @@ func (s *ServerSession) RemoteAddr() string {
 }
 func (s *ServerSession) AcceptStream(ctx context.Context) (Stream, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	id := s.streamMgr.GetNextStreamID()
-	err := s.pathMgr.GetPrimaryPath().AcceptStream(ctx, id)
-	if err != nil {
-		return nil, err
+	// Get the primary path
+	path := s.pathMgr.GetPrimaryPath()
+	if path == nil {
+		s.mu.Unlock()
+		return nil, protocol.NewPathNotExistsError(0)
 	}
-	streamImpl := s.streamMgr.CreateStream()
-	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
-	return streamImpl, nil
+
+	s.logger.Debug("Accepting new stream on path", "pathID", path.PathID())
+
+	// Accept a new stream from the client
+	stream := s.streamMgr.CreateStream()
+	if err := path.AcceptStream(ctx, stream.StreamID()); err != nil {
+		s.mu.Unlock()
+		s.logger.Error("Failed to accept stream", "error", err, "pathID", path.PathID())
+		return nil, fmt.Errorf("failed to accept stream: %w", err)
+	}
+
+	s.logger.Debug("Creating new stream", "streamID", stream.StreamID(), "pathID", path.PathID())
+	// Add the path to the stream (this will also register with packer)
+	if err := s.streamMgr.AddStreamPath(stream.StreamID(), path); err != nil {
+		s.mu.Unlock()
+		s.streamMgr.RemoveStream(stream.StreamID()) // Clean up if path addition fails
+		path.RemoveStream(stream.StreamID())
+		s.logger.Error("Failed to add path to stream",
+			"streamID", stream.StreamID(),
+			"pathID", path.PathID(),
+			"error", err)
+		return nil, fmt.Errorf("failed to add path to stream: %w", err)
+	}
+
+	s.mu.Unlock()
+
+	s.logger.Info("Successfully accepted stream",
+		"streamID", stream.StreamID(),
+		"pathID", path.PathID())
+
+	return stream, nil
 }
 
 func (s *ServerSession) OpenStreamSync(ctx context.Context) (Stream, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	id := s.streamMgr.GetNextStreamID()
-	err := s.pathMgr.GetPrimaryPath().OpenStreamSync(ctx, id)
+	// Get the primary path
+	primaryPath := s.pathMgr.GetPrimaryPath()
+	if primaryPath == nil {
+		return nil, protocol.NewPathNotExistsError(0)
+	}
+
+	s.logger.Debug("Opening stream synchronously", "pathID", primaryPath.PathID())
+
+	// Create the stream to get an ID
+	streamImpl := s.streamMgr.CreateStream()
+	streamID := streamImpl.StreamID()
+
+	// Open the stream with the generated ID
+	err := primaryPath.OpenStreamSync(ctx, streamID)
 	if err != nil {
+		s.streamMgr.RemoveStream(streamID)
 		return nil, err
 	}
-	streamImpl := s.streamMgr.CreateStream()
-	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
+
+	// Add the path to the stream
+	if err := s.streamMgr.AddStreamPath(streamID, primaryPath); err != nil {
+		s.streamMgr.RemoveStream(streamID)
+		return nil, err
+	}
+
+	s.logger.Debug("Successfully opened stream", "streamID", streamID, "pathID", primaryPath.PathID())
 	return streamImpl, nil
 }
 
@@ -107,13 +170,30 @@ func (s *ServerSession) OpenStream() (Stream, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	id := s.streamMgr.GetNextStreamID()
-	err := s.pathMgr.GetPrimaryPath().OpenStream(id)
+	// Get the primary path
+	primaryPath := s.pathMgr.GetPrimaryPath()
+	if primaryPath == nil {
+		return nil, protocol.NewPathNotExistsError(0)
+	}
+
+	// Create the stream to get an ID
+	streamImpl := s.streamMgr.CreateStream()
+	streamID := streamImpl.StreamID()
+
+	// Open the stream with the generated ID
+	err := primaryPath.OpenStream(streamID)
 	if err != nil {
+		s.streamMgr.RemoveStream(streamID)
 		return nil, err
 	}
-	streamImpl := s.streamMgr.CreateStream()
-	s.streamMgr.AddStreamPath(streamImpl.StreamID(), s.pathMgr.GetPrimaryPath())
+
+	// Add the path to the stream
+	if err := s.streamMgr.AddStreamPath(streamID, primaryPath); err != nil {
+		s.streamMgr.RemoveStream(streamID)
+		return nil, err
+	}
+
+	s.logger.Debug("Opened new stream", "streamID", streamID, "pathID", primaryPath.PathID())
 	return streamImpl, nil
 }
 
@@ -138,6 +218,16 @@ func (s *ServerSession) SendRawData(data []byte, pathID protocol.PathID, streamI
 }
 
 func (s *ServerSession) CloseWithError(code int, msg string) error {
-	// Not yet implemented.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.streamMgr != nil {
+		s.streamMgr.CloseAllStreams()
+	}
+
+	if pm, ok := s.pathMgr.(interface{ CloseAllPaths() }); ok {
+		pm.CloseAllPaths()
+	}
+
 	return nil
 }

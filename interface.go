@@ -67,6 +67,10 @@ type Session interface {
 	SessionID() protocol.SessionID
 	SendRawData(data []byte, pathID protocol.PathID, streamID protocol.StreamID) error
 	CloseWithError(code int, msg string) error
+	
+	// Transport layer access
+	Packer() *transport.Packer
+	Multiplexer() *transport.Multiplexer
 }
 
 // Listener represents a KWIK listener
@@ -80,4 +84,5 @@ type streamManager interface {
 	GetNextStreamID() protocol.StreamID
 	CreateStream() Stream
 	AddStreamPath(streamID protocol.StreamID, path transport.Path) error
+	RemoveStream(streamID protocol.StreamID)
 }

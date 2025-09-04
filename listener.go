@@ -3,6 +3,7 @@ package kwik
 import (
 	"context"
 	"crypto/tls"
+	"sync"
 
 	"github.com/quic-go/quic-go"
 	"github.com/s-anzie/kwik/internal/config"
@@ -14,7 +15,8 @@ type listener struct {
 	address        string
 	tls            *tls.Config
 	cfg            *config.Config
-	activeSessions uint64
+	activeSessions map[protocol.SessionID]Session
+	mu             sync.Mutex
 	closed         chan struct{}
 }
 
@@ -31,7 +33,7 @@ func listenAddr(address string, tls *tls.Config, cfg *config.Config) (Listener, 
 		address:        address,
 		tls:            tls,
 		cfg:            cfg,
-		activeSessions: 0,
+		activeSessions: make(map[protocol.SessionID]Session),
 		closed:         make(chan struct{}),
 	}, nil
 }
@@ -42,10 +44,12 @@ func (l *listener) Accept(ctx context.Context) (Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	id := protocol.SessionID(l.activeSessions + 1)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	id := protocol.SessionID(len(l.activeSessions) + 1)
 	//create and return a new KWIK session
 	sess := NewServerSession(id, conn)
-	l.activeSessions++
+	l.activeSessions[id] = sess
 	return sess, nil
 }
 
@@ -55,9 +59,16 @@ func (l *listener) Addr() string {
 
 func (l *listener) Close() error {
 	close(l.closed)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, sess := range l.activeSessions {
+		sess.CloseWithError(0, "listener closed")
+	}
 	return l.quiclistener.Close()
 }
 
 func (l *listener) GetActiveSessionCount() int {
-	return int(l.activeSessions)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.activeSessions)
 }

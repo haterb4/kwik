@@ -33,6 +33,7 @@ type Multiplexer struct {
 	metricsMu     sync.Mutex
 	ackSentCount  int64
 	nackSentCount int64
+	packer        *Packer
 }
 
 type streamQueue struct {
@@ -46,29 +47,20 @@ type streamQueue struct {
 	lastNackAt time.Time
 }
 
-func NewMultiplexer() *Multiplexer {
+func NewMultiplexer(packer *Packer) *Multiplexer {
 	return &Multiplexer{
 		queues:                     make(map[protocol.StreamID]*streamQueue),
 		logger:                     logger.NewLogger(logger.LogLevelDebug).WithComponent("MULTIPLEXER"),
 		received:                   make(map[protocol.PathID]map[uint64]struct{}),
-		ackThreshold:               32,   // Higher threshold before immediate ACK
-		ackIntervalMs:              500,  // Less frequent ACK intervals
-		nackCooldownMs:             500,  // Longer cooldown between NACKs
+		ackThreshold:               32,  // Higher threshold before immediate ACK
+		ackIntervalMs:              500, // Less frequent ACK intervals
+		nackCooldownMs:             500, // Longer cooldown between NACKs
 		nackMaxRangeCount:          64,
 		nackMaxTotalSeqs:           4096,
 		lastSeenPathForStream:      make(map[protocol.StreamID]protocol.PathID),
 		lastSeenPacketSeqForStream: make(map[protocol.StreamID]uint64),
+		packer:                     packer,
 	}
-}
-
-var defaultMux *Multiplexer
-
-func SetDefaultMultiplexer(m *Multiplexer) {
-	defaultMux = m
-}
-
-func GetDefaultMultiplexer() *Multiplexer {
-	return defaultMux
 }
 
 // PushPacket accepts a raw packet (which is prefixed by 4-byte length when serialized
@@ -96,8 +88,8 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 				if err != nil {
 					m.logger.Error("failed to decode ack payload", "err", err)
 				} else {
-					if pk := GetDefaultPacker(); pk != nil {
-						pk.OnAck(pathID, ranges)
+					if m.packer != nil {
+						m.packer.OnAck(pathID, ranges)
 					}
 				}
 				continue
@@ -108,16 +100,16 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 				if err != nil {
 					m.logger.Error("failed to decode nack payload", "err", err)
 				} else {
-					if pk := GetDefaultPacker(); pk != nil {
+					if m.packer != nil {
 						// instruct packer to resend those ranges on this path
-						pk.ResendRanges(pathID, ranges)
+						m.packer.ResendRanges(pathID, ranges)
 					}
 				}
 				continue
 			}
 
 			// other control frames: try to deliver to registered path's control handler
-			if path := GetDefaultPacker().GetRegisteredPath(pathID); path != nil {
+			if path := m.packer.GetRegisteredPath(pathID); path != nil {
 				// best effort; ignore errors
 				_ = path.HandleControlFrame(f)
 				continue
@@ -159,8 +151,8 @@ func (m *Multiplexer) PushPacketWithSeq(pathID protocol.PathID, packetSeq uint64
 			if err != nil {
 				m.logger.Error("failed to decode ack payload", "err", err)
 			} else {
-				if pk := GetDefaultPacker(); pk != nil {
-					pk.OnAck(pathID, ranges)
+				if m.packer != nil {
+					m.packer.OnAck(pathID, ranges)
 				}
 			}
 			continue
@@ -170,8 +162,8 @@ func (m *Multiplexer) PushPacketWithSeq(pathID protocol.PathID, packetSeq uint64
 			if err != nil {
 				m.logger.Error("failed to decode nack payload", "err", err)
 			} else {
-				if pk := GetDefaultPacker(); pk != nil {
-					pk.ResendRanges(pathID, ranges)
+				if m.packer != nil {
+					m.packer.ResendRanges(pathID, ranges)
 				}
 			}
 			continue
@@ -181,7 +173,7 @@ func (m *Multiplexer) PushPacketWithSeq(pathID protocol.PathID, packetSeq uint64
 		// registered path's control handler (handshake/ping/pong) so it can reply
 		// immediately. This mirrors the behavior in PushPacket (no-seq path).
 		if f.StreamID == 0 {
-			if path := GetDefaultPacker().GetRegisteredPath(pathID); path != nil {
+			if path := m.packer.GetRegisteredPath(pathID); path != nil {
 				// log dispatching control frame to path
 				m.logger.Debug("dispatching control frame to path handler", "path", pathID, "type", f.Type, "len", len(f.Payload))
 				if err := path.HandleControlFrame(f); err != nil {
@@ -208,7 +200,7 @@ func (m *Multiplexer) recordReceivedPacket(pathID protocol.PathID, packetSeq uin
 		m.received[pathID] = mp
 	}
 	mp[packetSeq] = struct{}{}
-	m.logger.Debug("recorded packet receipt", "path", pathID, "seq", packetSeq)
+	// m.logger.Debug("recorded packet receipt", "path", pathID, "seq", packetSeq)
 	// if we've reached the threshold, schedule an immediate ack send
 	if len(mp) >= m.ackThreshold {
 		go m.sendAckNow(pathID)
@@ -225,9 +217,9 @@ func (m *Multiplexer) sendAckNow(pid protocol.PathID) {
 	}
 	payload := protocol.EncodeAckPayload(ranges)
 	ackFrame := &protocol.Frame{Type: protocol.FrameTypeAck, StreamID: 0, Seq: 0, Payload: payload}
-	if pk := GetDefaultPacker(); pk != nil {
-		if path := pk.GetRegisteredPath(pid); path != nil {
-			_ = pk.SubmitFrame(path, ackFrame)
+	if m.packer != nil {
+		if path := m.packer.GetRegisteredPath(pid); path != nil {
+			_ = m.packer.SubmitFrame(path, ackFrame)
 			m.metricsMu.Lock()
 			m.ackSentCount++
 			m.metricsMu.Unlock()
@@ -275,9 +267,8 @@ func (m *Multiplexer) sendNackRanges(ranges []protocol.AckRange) {
 	}
 	payload := protocol.EncodeAckPayload(ranges)
 	nackFrame := &protocol.Frame{Type: protocol.FrameTypeNack, StreamID: 0, Seq: 0, Payload: payload}
-	pk := GetDefaultPacker()
-	if pk == nil {
-		m.logger.Debug("no packer available to send nack")
+	if m.packer == nil {
+		m.logger.Warn("no packer available for NACK")
 		return
 	}
 	// send NACK on each path we have recorded receipts for
@@ -288,9 +279,9 @@ func (m *Multiplexer) sendNackRanges(ranges []protocol.AckRange) {
 	}
 	m.mu.RUnlock()
 	for _, pid := range paths {
-		if path := pk.GetRegisteredPath(pid); path != nil {
+		if path := m.packer.GetRegisteredPath(pid); path != nil {
 			// submit via packer
-			if err := pk.SubmitFrame(path, nackFrame); err != nil {
+			if err := m.packer.SubmitFrame(path, nackFrame); err != nil {
 				m.logger.Warn("failed to submit nack frame", "path", pid, "err", err)
 			} else {
 				m.metricsMu.Lock()
@@ -324,13 +315,12 @@ func (m *Multiplexer) sendNackRangesToPath(pid protocol.PathID, ranges []protoco
 	}
 	payload := protocol.EncodeAckPayload(ranges)
 	nackFrame := &protocol.Frame{Type: protocol.FrameTypeNack, StreamID: 0, Seq: 0, Payload: payload}
-	pk := GetDefaultPacker()
-	if pk == nil {
-		m.logger.Debug("no packer available to send nack")
+	if m.packer == nil {
+		m.logger.Warn("no packer available for NACK")
 		return
 	}
-	if path := pk.GetRegisteredPath(pid); path != nil {
-		if err := pk.SubmitFrame(path, nackFrame); err != nil {
+	if path := m.packer.GetRegisteredPath(pid); path != nil {
+		if err := m.packer.SubmitFrame(path, nackFrame); err != nil {
 			m.logger.Warn("failed to submit nack frame", "path", pid, "err", err)
 		} else {
 			m.metricsMu.Lock()
@@ -405,10 +395,10 @@ func (m *Multiplexer) StartAckLoop(intervalMs int) {
 					Payload:  payload,
 				}
 				// send via packer on same path
-				if pk := GetDefaultPacker(); pk != nil {
-					if path := pk.GetRegisteredPath(pid); path != nil {
+				if m.packer != nil {
+					if path := m.packer.GetRegisteredPath(pid); path != nil {
 						// submit ack frame
-						_ = pk.SubmitFrame(path, ackFrame)
+						_ = m.packer.SubmitFrame(path, ackFrame)
 						// clear recorded receipts that we acked
 						m.mu.Lock()
 						if mp, ok := m.received[pid]; ok {

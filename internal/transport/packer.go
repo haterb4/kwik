@@ -3,7 +3,6 @@ package transport
 import (
 	"bytes"
 	"encoding/binary"
-	"strings"
 	"sync"
 	"time"
 
@@ -38,21 +37,16 @@ func NewPacker(maxPacketSize int) *Packer {
 	return &Packer{
 		queues:        make(map[protocol.PathID][]*protocol.Frame),
 		maxPacketSize: maxPacketSize,
-		logger:        logger.NewLogger(logger.LogLevelDebug).WithComponent("PACKER"),
+		logger:        logger.NewLogger(logger.LogLevelSilent).WithComponent("PACKER"),
 		nextPacketSeq: make(map[protocol.PathID]uint64),
 		pending:       make(map[protocol.PathID]map[uint64]*pendingPacket),
 		paths:         make(map[protocol.PathID]Path),
 		// improved defaults for better reliability
-		maxAttempts:   8,        // More attempts before giving up
-		baseBackoffMs: 250,      // Higher base backoff for QUIC
-		maxBackoffMs:  5000,     // Higher max backoff
+		maxAttempts:   8,    // More attempts before giving up
+		baseBackoffMs: 250,  // Higher base backoff for QUIC
+		maxBackoffMs:  5000, // Higher max backoff
 	}
 }
-
-var defaultPacker *Packer
-
-func SetDefaultPacker(p *Packer) { defaultPacker = p }
-func GetDefaultPacker() *Packer  { return defaultPacker }
 
 // SubmitFrame queues a frame for the given path and attempts to assemble a packet
 // containing as many whole frames as possible (without splitting frames) up to
@@ -99,19 +93,23 @@ func (p *Packer) SubmitFrame(path Path, f *protocol.Frame) error {
 
 	// ensure the target quic stream exists on the path
 	carrierStreamID := assembled[0].StreamID
-	// try to open the stream if needed; ignore errors that indicate it exists
-	// For control stream (0), don't try to open if it already exists
-	if carrierStreamID == protocol.StreamID(0) {
-		// control stream should already exist, don't try to open
-	} else {
-		// Try to open the stream, but ignore "stream already exists" errors
-		if err := path.OpenStream(carrierStreamID); err != nil {
-			// Check if it's a "stream already exists" error - if so, ignore it silently
-			if errStr := err.Error(); !strings.Contains(errStr, "stream allready exists") && !strings.Contains(errStr, "Stream already exists") {
-				// Only log non-duplicate errors
+	
+	// For non-control streams, ensure the stream exists
+	if carrierStreamID != protocol.StreamID(0) {
+		// First check if stream already exists to avoid unnecessary OpenStream calls
+		if stream, ok := path.(interface{ HasStream(protocol.StreamID) bool }); ok {
+			if !stream.HasStream(carrierStreamID) {
+				// Only try to open if stream doesn't exist
+				if err := path.OpenStream(carrierStreamID); err != nil {
+					p.logger.Debug("failed to open stream for packer", "path", pid, "stream", carrierStreamID, "err", err)
+					// Continue anyway as the stream might have been created by a concurrent operation
+				}
+			}
+		} else {
+			// Fallback to always trying to open if we can't check existence
+			if err := path.OpenStream(carrierStreamID); err != nil {
 				p.logger.Debug("failed to open stream for packer", "path", pid, "stream", carrierStreamID, "err", err)
 			}
-			// For duplicate errors, continue silently
 		}
 	}
 
@@ -287,17 +285,30 @@ func (p *Packer) StartRetransmitLoop(resend func(pathID protocol.PathID, seq uin
 // RegisterPath allows packer to know about active paths (used by retransmit loop if needed)
 func (p *Packer) RegisterPath(path Path) {
 	pid := path.PathID()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	// If path is already registered, log and return early
+	if _, ok := p.paths[pid]; ok {
+		p.logger.Debug("Path already registered with packer", "pathID", pid)
+		return
+	}
+
+	// Initialize sequence number tracking for this path
 	p.seqMu.Lock()
 	if _, ok := p.nextPacketSeq[pid]; !ok {
 		p.nextPacketSeq[pid] = 0
 	}
 	p.seqMu.Unlock()
-	p.mu.Lock()
+
+	// Initialize pending packets map for this path
 	if _, ok := p.pending[pid]; !ok {
 		p.pending[pid] = make(map[uint64]*pendingPacket)
 	}
+
+	// Register the path
 	p.paths[pid] = path
-	p.mu.Unlock()
+	p.logger.Debug("Registered path with packer", "pathID", pid)
 }
 
 // UnregisterPath removes a previously registered path from the packer.

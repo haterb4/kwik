@@ -17,7 +17,7 @@ type pathManagerImpl struct {
 	nextPathID    uint64
 	tlsCfg        *tls.Config
 	config        *config.Config
-	primaryPahtID protocol.PathID
+	primaryPathID protocol.PathID
 	mu            sync.Mutex
 	logger        logger.Logger
 }
@@ -28,7 +28,7 @@ func NewClientPathManager(tls *tls.Config, cfg *config.Config) *pathManagerImpl 
 		nextPathID:    0,
 		tlsCfg:        tls,
 		config:        cfg,
-		primaryPahtID: 0, // Initialize to 0 (invalid)
+		primaryPathID: 0, // Initialize to 0 (invalid)
 		logger:        logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH_MANAGER"),
 	}
 }
@@ -36,7 +36,7 @@ func NewServerPathManager() *pathManagerImpl {
 	return &pathManagerImpl{
 		paths:         make(map[protocol.PathID]*path),
 		nextPathID:    0,
-		primaryPahtID: 0, // Initialize to 0 (invalid)
+		primaryPathID: 0, // Initialize to 0 (invalid)
 		logger:        logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH_MANAGER"),
 	}
 }
@@ -45,7 +45,7 @@ func NewServerPathManager() *pathManagerImpl {
 // It returns the newly created PathID or an error if the connection could not be established or if the PathID already exists.
 // The function is thread-safe and ensures that each PathID is unique by using atomic operations.
 // If a path with the generated PathID already exists, it returns a PathNotExistsError.
-func (pm *pathManagerImpl) OpenPath(ctx context.Context, address string) (protocol.PathID, error) {
+func (pm *pathManagerImpl) OpenPath(ctx context.Context, address string, session Session) (protocol.PathID, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -58,14 +58,14 @@ func (pm *pathManagerImpl) OpenPath(ctx context.Context, address string) (protoc
 		return 0, protocol.NewPathNotExistsError(nextPathID)
 	}
 	// mark outbound dialed paths as client-side
-	path := NewPath(nextPathID, conn, true)
+	path := NewPath(nextPathID, conn, true, session)
 
 	pm.paths[nextPathID] = path
 	pm.logger.Debug("Created client path", "pathID", nextPathID, "address", address)
 	return nextPathID, nil
 }
 
-func (pm *pathManagerImpl) AccpetPath(conn *quic.Conn) (protocol.PathID, error) {
+func (pm *pathManagerImpl) AccpetPath(conn *quic.Conn, session Session) (protocol.PathID, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -74,7 +74,7 @@ func (pm *pathManagerImpl) AccpetPath(conn *quic.Conn) (protocol.PathID, error) 
 		return 0, protocol.NewPathNotExistsError(nextPathID)
 	}
 	// mark accepted paths as server-side (isClient=false)
-	path := NewPath(nextPathID, conn, false)
+	path := NewPath(nextPathID, conn, false, session)
 	pm.paths[nextPathID] = path
 	pm.logger.Debug("Accepted server path", "pathID", nextPathID, "remoteAddr", conn.RemoteAddr().String())
 	return nextPathID, nil
@@ -84,15 +84,17 @@ func (pm *pathManagerImpl) SetPrimaryPath(id protocol.PathID) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	if _, ok := pm.paths[id]; !ok {
-		panic(protocol.NewPathNotExistsError(id))
+		pm.logger.Error("Cannot set primary path: path does not exist", "pathID", id)
+		return
 	}
-	pm.primaryPahtID = id
+	pm.primaryPathID = id
+	pm.logger.Debug("Set primary path", "pathID", id)
 }
 
 func (pm *pathManagerImpl) GetPrimaryPath() Path {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	if exists, ok := pm.paths[pm.primaryPahtID]; ok {
+	if exists, ok := pm.paths[pm.primaryPathID]; ok {
 		return exists
 	}
 	return nil
@@ -105,4 +107,18 @@ func (pm *pathManagerImpl) GetPath(id protocol.PathID) Path {
 		return exists
 	}
 	return nil
+}
+
+func (pm *pathManagerImpl) RemovePath(id protocol.PathID) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	delete(pm.paths, id)
+}
+
+func (pm *pathManagerImpl) CloseAllPaths() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for _, path := range pm.paths {
+		path.Close()
+	}
 }

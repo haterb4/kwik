@@ -47,7 +47,7 @@ func NewBenchmarkAnalyzer(filename string) (*BenchmarkAnalyzer, error) {
 }
 
 func (ba *BenchmarkAnalyzer) GenerateReport() {
-	fmt.Println("=== RAPPORT D'ANALYSE DES PERFORMANCES QUIC ===\n")
+	fmt.Println("=== RAPPORT D'ANALYSE DES PERFORMANCES QUIC ===")
 
 	ba.printSummaryStats()
 	ba.printThroughputAnalysis()
