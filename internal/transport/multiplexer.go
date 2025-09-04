@@ -51,9 +51,9 @@ func NewMultiplexer() *Multiplexer {
 		queues:                     make(map[protocol.StreamID]*streamQueue),
 		logger:                     logger.NewLogger(logger.LogLevelDebug).WithComponent("MULTIPLEXER"),
 		received:                   make(map[protocol.PathID]map[uint64]struct{}),
-		ackThreshold:               16,
-		ackIntervalMs:              200,
-		nackCooldownMs:             200,
+		ackThreshold:               32,   // Higher threshold before immediate ACK
+		ackIntervalMs:              500,  // Less frequent ACK intervals
+		nackCooldownMs:             500,  // Longer cooldown between NACKs
 		nackMaxRangeCount:          64,
 		nackMaxTotalSeqs:           4096,
 		lastSeenPathForStream:      make(map[protocol.StreamID]protocol.PathID),
@@ -182,9 +182,14 @@ func (m *Multiplexer) PushPacketWithSeq(pathID protocol.PathID, packetSeq uint64
 		// immediately. This mirrors the behavior in PushPacket (no-seq path).
 		if f.StreamID == 0 {
 			if path := GetDefaultPacker().GetRegisteredPath(pathID); path != nil {
-				// best effort; ignore errors
-				_ = path.HandleControlFrame(f)
+				// log dispatching control frame to path
+				m.logger.Debug("dispatching control frame to path handler", "path", pathID, "type", f.Type, "len", len(f.Payload))
+				if err := path.HandleControlFrame(f); err != nil {
+					m.logger.Warn("path HandleControlFrame returned error", "path", pathID, "err", err)
+				}
 				continue
+			} else {
+				m.logger.Warn("no registered path found for control frame", "path", pathID, "type", f.Type)
 			}
 		}
 
@@ -206,6 +211,9 @@ func (m *Multiplexer) recordReceivedPacket(pathID protocol.PathID, packetSeq uin
 	m.logger.Debug("recorded packet receipt", "path", pathID, "seq", packetSeq)
 	// if we've reached the threshold, schedule an immediate ack send
 	if len(mp) >= m.ackThreshold {
+		go m.sendAckNow(pathID)
+	} else if len(mp) > 0 && len(mp)%8 == 0 {
+		// Send ACKs more frequently for smaller batches to reduce latency
 		go m.sendAckNow(pathID)
 	}
 }
@@ -442,12 +450,12 @@ func (m *Multiplexer) enqueueFrame(f *protocol.Frame) {
 	// drop duplicates or old frames
 	if f.Seq < q.expectedSeq {
 		q.mu.Unlock()
-		m.logger.Debug("dropping old/duplicate frame", "stream", f.StreamID, "seq", f.Seq, "expected", q.expectedSeq)
+		// Silenced: m.logger.Debug("dropping old/duplicate frame", "stream", f.StreamID, "seq", f.Seq, "expected", q.expectedSeq)
 		return
 	}
 	if _, exists := q.framesBySeq[f.Seq]; exists {
 		q.mu.Unlock()
-		m.logger.Debug("duplicate frame ignored", "stream", f.StreamID, "seq", f.Seq)
+		// Silenced: m.logger.Debug("duplicate frame ignored", "stream", f.StreamID, "seq", f.Seq)
 		return
 	}
 

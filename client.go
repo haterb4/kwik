@@ -70,17 +70,9 @@ func (s *ClientSession) connect(ctx context.Context) error {
 		return protocol.NewInvalidPathIDError(id)
 	}
 	s.pathMgr.SetPrimaryPath(id)
-	// ensure default packer/multiplexer exist for this process
-	if transport.GetDefaultPacker() == nil {
-		pk := transport.NewPacker(1200)
-		transport.SetDefaultPacker(pk)
-		pk.StartRetransmitLoop(nil)
-	}
-	if transport.GetDefaultMultiplexer() == nil {
-		mx := transport.NewMultiplexer()
-		transport.SetDefaultMultiplexer(mx)
-		mx.StartAckLoop(200)
-	}
+
+	// Default packer/multiplexer are now created in NewPath
+
 	return nil
 }
 

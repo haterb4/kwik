@@ -17,8 +17,6 @@ type Path interface {
 	WriteStream(streamID protocol.StreamID, p []byte) (int, error)
 	// SendControlFrame sends a control frame (handshake, ping, etc.) on the path
 	SendControlFrame(f *protocol.Frame) error
-	// StartHandshake triggers the per-path handshake process and returns when complete or error
-	StartHandshake() error
 	// HandleControlFrame is invoked when an inbound control frame (StreamID 0) is received
 	HandleControlFrame(f *protocol.Frame) error
 	LocalAddr() string
@@ -36,11 +34,4 @@ type PathManager interface {
 	SetPrimaryPath(id protocol.PathID)
 	// ListPaths() []Path
 	GetPrimaryPath() Path
-}
-
-type ControlManager interface {
-	SetConn(conn *quic.Conn)
-}
-type DataManager interface {
-	SetConn(conn *quic.Conn)
 }

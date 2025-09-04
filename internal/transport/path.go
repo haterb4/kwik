@@ -30,7 +30,8 @@ type path struct {
 	sessionReady    bool
 	handshakeRespCh chan *protocol.Frame
 	// health check
-	healthIntervalMs int
+	healthIntervalMs  int
+	healthLoopStarted int32 // atomic bool to prevent multiple health loops
 	// health metrics/state
 	pingsSent              int64
 	pongsRecv              int64
@@ -45,16 +46,67 @@ type path struct {
 	controlCreating bool
 }
 
-func NewPath(id protocol.PathID, conn *quic.Conn) *path {
-	return &path{
+func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool) *path {
+	path := path{
 		id:                  id,
 		conn:                conn,
+		isClient:            isClient,
 		streams:             make(map[protocol.StreamID]*quic.Stream),
 		logger:              logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH"),
 		healthIntervalMs:    1000,
 		healthy:             1,
 		missedPongThreshold: 3,
 	}
+	// Initialize control stream readiness channel
+	path.controlReady = make(chan struct{})
+
+	// Ensure default packer/multiplexer exist
+	if GetDefaultPacker() == nil {
+		pk := NewPacker(1200)
+		SetDefaultPacker(pk)
+		pk.StartRetransmitLoop(nil)
+	}
+	if GetDefaultMultiplexer() == nil {
+		mx := NewMultiplexer()
+		SetDefaultMultiplexer(mx)
+		mx.StartAckLoop(1000) // Less frequent ACK loop for better performance
+	}
+
+	// Register the path immediately so it can receive control frames
+	GetDefaultPacker().RegisterPath(&path)
+
+	// Opening or accepting the control stream here and perform the handshake here before returning the path.
+	if isClient {
+		stream, err := conn.OpenStreamSync(context.Background())
+		if err != nil {
+			panic(err)
+		}
+		path.streams[protocol.StreamID(0)] = stream
+		// Mark control stream as ready since we just created it
+		close(path.controlReady)
+		go path.runStreamReader(protocol.StreamID(0), stream)
+		err = path.startClientHandshake()
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		// Server waits for client to open the control stream
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		stream, err := conn.AcceptStream(ctx)
+		if err != nil {
+			panic(err)
+		}
+		path.streams[protocol.StreamID(0)] = stream
+		// Mark control stream as ready since we just accepted it
+		close(path.controlReady)
+		go path.runStreamReader(protocol.StreamID(0), stream)
+		err = path.startServerHandshake()
+		if err != nil {
+			panic(err)
+		}
+	}
+	return &path
 }
 func (p *path) LocalAddr() string {
 	return p.conn.LocalAddr().String()
@@ -127,17 +179,19 @@ func (p *path) OpenStream(streamID protocol.StreamID) error {
 func (p *path) AcceptStream(ctx context.Context, streamID protocol.StreamID) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.logger.Debug("Waiting for New Quic Stream on path %d", p.id)
+	p.logger.Debug("Waiting for New Quic Stream on path: ", p.id)
 	stream, err := p.conn.AcceptStream(ctx)
 	if err != nil {
 		return err
 	}
-	p.logger.Debug("Accepted New Quic Stream %d for stream %d on path %d", stream.StreamID(), streamID, p.id)
+	p.logger.Debug("Accepted New Quic Stream ", stream.StreamID(), " for stream ", streamID, " on path ", p.id)
 
 	if _, ok := p.streams[streamID]; ok {
 		return protocol.NewExistStreamError(p.id, streamID)
 	}
 	p.streams[streamID] = stream
+	// start reader goroutine to forward length-prefixed packets to multiplexer
+	go p.runStreamReader(streamID, stream)
 	return nil
 }
 
@@ -162,6 +216,10 @@ func (p *path) runStreamReader(streamID protocol.StreamID, s *quic.Stream) {
 			p.logger.Debug("failed to read packet body", "path", p.id, "stream", streamID, "err", err)
 			return
 		}
+		// detailed debug for control stream packets
+		if streamID == protocol.StreamID(0) && p.logger != nil {
+			p.logger.Debug("control stream packet received", "path", p.id, "stream", streamID, "seq", packetSeq, "len", l)
+		}
 		if mx := GetDefaultMultiplexer(); mx != nil {
 			_ = mx.PushPacketWithSeq(p.id, packetSeq, buf)
 		}
@@ -170,8 +228,13 @@ func (p *path) runStreamReader(streamID protocol.StreamID, s *quic.Stream) {
 
 // SendControlFrame writes a control frame (handshake, ping, pong) on the reserved control stream (streamID 0).
 func (p *path) SendControlFrame(f *protocol.Frame) error {
+	// Silenced ping/pong logs
+	if f.Type != protocol.FrameTypePing && f.Type != protocol.FrameTypePong {
+		p.logger.Debug("sending control frame", "path", p.id, "type", f.Type, "isClient", p.isClient)
+	}
 	// ensure control stream exists (create exactly once)
 	if err := p.ensureControlStream(); err != nil {
+		p.logger.Error("failed to ensure control stream", "path", p.id, "err", err)
 		return err
 	}
 	// encode frame into packet with length prefix and seq=0
@@ -187,8 +250,8 @@ func (p *path) SendControlFrame(f *protocol.Frame) error {
 	var seqBuf [8]byte
 	binary.BigEndian.PutUint64(seqBuf[:], uint64(0))
 	outWithSeq := append(seqBuf[:], out...)
-	// debug log for outgoing control frame
-	if p.logger != nil {
+	// debug log for outgoing control frame (silenced for ping/pong)
+	if p.logger != nil && f.Type != protocol.FrameTypePing && f.Type != protocol.FrameTypePong {
 		p.logger.Debug("sending control frame", "path", p.id, "type", f.Type, "len", len(outWithSeq))
 	}
 	// write with packetSeq 0
@@ -199,18 +262,36 @@ func (p *path) SendControlFrame(f *protocol.Frame) error {
 // ensureControlStream creates the reserved control stream exactly once and
 // allows multiple callers to wait until it's ready.
 func (p *path) ensureControlStream() error {
+	// p.logger.Debug("ensuring control stream", "path", p.id, "isClient", p.isClient)
 	p.controlMu.Lock()
 	if p.controlReady != nil {
-		// already created
+		// already created or being created
 		ch := p.controlReady
 		p.controlMu.Unlock()
+		// p.logger.Debug("control stream already ready, waiting", "path", p.id)
 		<-ch
 		return nil
 	}
+
+	// Check if control stream already exists (created in NewPath)
+	p.mu.Lock()
+	_, exists := p.streams[protocol.StreamID(0)]
+	p.mu.Unlock()
+
+	if exists {
+		// Control stream already exists, just mark as ready
+		p.controlReady = make(chan struct{})
+		close(p.controlReady)
+		p.controlMu.Unlock()
+		p.logger.Debug("control stream already exists", "path", p.id)
+		return nil
+	}
+
 	// not created yet; mark creating
 	p.controlReady = make(chan struct{})
 	p.controlCreating = true
 	p.controlMu.Unlock()
+	p.logger.Debug("creating control stream", "path", p.id, "isClient", p.isClient)
 
 	// attempt to open or accept control stream depending on role
 	var err error
@@ -218,8 +299,9 @@ func (p *path) ensureControlStream() error {
 		// client actively opens the control stream
 		err = p.OpenStream(protocol.StreamID(0))
 	} else {
-		// server should accept the incoming control stream
-		err = p.AcceptStream(context.Background(), protocol.StreamID(0))
+		// For server, control stream should already exist from NewPath
+		p.logger.Error("control stream should have been created in NewPath", "path", p.id)
+		err = protocol.NewHandshakeFailedError(p.id)
 	}
 
 	p.controlMu.Lock()
@@ -229,9 +311,42 @@ func (p *path) ensureControlStream() error {
 	p.controlMu.Unlock()
 	return err
 }
+func (p *path) startServerHandshake() error {
+	p.sessionMu.Lock()
+	if p.sessionReady {
+		p.sessionMu.Unlock()
+		return nil
+	}
+	p.sessionMu.Unlock()
+
+	// Server waits for handshake from client
+	// The handshake will be processed in HandleControlFrame when received
+	// We just need to wait for the session to become ready
+	const maxWaitTime = 10 * time.Second
+	const checkInterval = 100 * time.Millisecond
+
+	start := time.Now()
+	for {
+		p.sessionMu.Lock()
+		ready := p.sessionReady
+		p.sessionMu.Unlock()
+
+		if ready {
+			p.logger.Info("server handshake completed", "path", p.id)
+			return nil
+		}
+
+		if time.Since(start) > maxWaitTime {
+			p.logger.Error("server handshake timeout", "path", p.id)
+			return protocol.NewHandshakeFailedError(p.id)
+		}
+
+		time.Sleep(checkInterval)
+	}
+}
 
 // StartHandshake performs a simple handshake exchange: send Handshake, wait for HandshakeResp.
-func (p *path) StartHandshake() error {
+func (p *path) startClientHandshake() error {
 	p.sessionMu.Lock()
 	if p.sessionReady {
 		p.sessionMu.Unlock()
@@ -288,6 +403,13 @@ func (p *path) StartHandshake() error {
 }
 
 func (p *path) startHealthLoop() {
+	// Prevent multiple health loops
+	if !atomic.CompareAndSwapInt32(&p.healthLoopStarted, 0, 1) {
+		p.logger.Debug("health loop already started", "path", p.id)
+		return
+	}
+
+	p.logger.Debug("starting health loop", "path", p.id)
 	ticker := time.NewTicker(time.Duration(p.healthIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -297,7 +419,7 @@ func (p *path) startHealthLoop() {
 		binary.BigEndian.PutUint64(tb[:], uint64(ts))
 		ping := &protocol.Frame{Type: protocol.FrameTypePing, StreamID: 0, Seq: 0, Payload: tb[:]}
 		if err := p.SendControlFrame(ping); err != nil {
-			p.logger.Warn("failed to send ping", "path", p.id, "err", err)
+			// Silenced: p.logger.Warn("failed to send ping", "path", p.id, "err", err)
 			continue
 		}
 		atomic.AddInt64(&p.pingsSent, 1)
@@ -308,10 +430,10 @@ func (p *path) startHealthLoop() {
 		if last == 0 || (time.Now().UnixMilli()-last) > int64(p.healthIntervalMs) {
 			// missed
 			miss := atomic.AddInt64(&p.missedPongs, 1)
-			p.logger.Warn("missed pong", "path", p.id, "missed", miss)
+			// Silenced: p.logger.Warn("missed pong", "path", p.id, "missed", miss)
 			if miss >= int64(p.missedPongThreshold) {
 				atomic.StoreInt32(&p.healthy, 0)
-				p.logger.Warn("path marked unhealthy", "path", p.id)
+				// Silenced: p.logger.Warn("path marked unhealthy", "path", p.id)
 			}
 		} else {
 			// received pong recently
@@ -336,24 +458,32 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 		atomic.StoreInt64(&p.lastPongAtUnixMilli, now)
 		atomic.StoreInt64(&p.missedPongs, 0)
 		atomic.StoreInt32(&p.healthy, 1)
-		p.logger.Debug("received pong", "path", p.id, "time", now)
+		// Silenced: p.logger.Debug("received pong", "path", p.id, "time", now)
 		return nil
 	case protocol.FrameTypeHandshake:
+		p.logger.Debug("received handshake frame", "path", p.id, "isClient", p.isClient)
 		// reply with handshake response
 		// echo the nonce back as a response
 		resp := &protocol.Frame{Type: protocol.FrameTypeHandshakeResp, StreamID: 0, Seq: 0, Payload: f.Payload}
 		if err := p.SendControlFrame(resp); err != nil {
+			p.logger.Error("failed to send handshake response", "path", p.id, "err", err)
 			return err
 		}
 		p.sessionMu.Lock()
 		p.sessionReady = true
 		p.sessionMu.Unlock()
+		p.logger.Info("handshake completed (server-side)", "path", p.id, "isClient", p.isClient)
+		// start health loop now that session is established
+		go p.startHealthLoop()
 		return nil
 	case protocol.FrameTypeHandshakeResp:
+		p.logger.Debug("received handshake response", "path", p.id, "isClient", p.isClient)
 		// signal waiting StartHandshake if present
 		select {
 		case p.handshakeRespCh <- f:
+			p.logger.Debug("sent handshake response to channel", "path", p.id)
 		default:
+			p.logger.Debug("handshake response channel full or not ready", "path", p.id)
 		}
 		// additionally if we have an expected nonce, validate it
 		p.sessionMu.Lock()
@@ -364,10 +494,12 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 			p.sessionMu.Unlock()
 			p.logger.Debug("path sessionReady set via handshake response", "path", p.id, "isClient", p.isClient)
 			p.logger.Info("handshake validated via response", "path", p.id, "nonce", hex.EncodeToString(f.Payload))
+			// start health loop now that session is established
+			go p.startHealthLoop()
 			return nil
 		}
 		p.sessionMu.Unlock()
-		p.logger.Warn("received unexpected handshake response", "path", p.id)
+		p.logger.Warn("received unexpected handshake response", "path", p.id, "expected", hex.EncodeToString(expected), "got", hex.EncodeToString(f.Payload))
 		return nil
 	default:
 		p.logger.Debug("unknown control frame", "type", f.Type)

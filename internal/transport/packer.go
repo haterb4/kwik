@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,10 +42,10 @@ func NewPacker(maxPacketSize int) *Packer {
 		nextPacketSeq: make(map[protocol.PathID]uint64),
 		pending:       make(map[protocol.PathID]map[uint64]*pendingPacket),
 		paths:         make(map[protocol.PathID]Path),
-		// sensible defaults
-		maxAttempts:   5,
-		baseBackoffMs: 100,
-		maxBackoffMs:  2000,
+		// improved defaults for better reliability
+		maxAttempts:   8,        // More attempts before giving up
+		baseBackoffMs: 250,      // Higher base backoff for QUIC
+		maxBackoffMs:  5000,     // Higher max backoff
 	}
 }
 
@@ -99,7 +100,20 @@ func (p *Packer) SubmitFrame(path Path, f *protocol.Frame) error {
 	// ensure the target quic stream exists on the path
 	carrierStreamID := assembled[0].StreamID
 	// try to open the stream if needed; ignore errors that indicate it exists
-	_ = path.OpenStream(carrierStreamID)
+	// For control stream (0), don't try to open if it already exists
+	if carrierStreamID == protocol.StreamID(0) {
+		// control stream should already exist, don't try to open
+	} else {
+		// Try to open the stream, but ignore "stream already exists" errors
+		if err := path.OpenStream(carrierStreamID); err != nil {
+			// Check if it's a "stream already exists" error - if so, ignore it silently
+			if errStr := err.Error(); !strings.Contains(errStr, "stream allready exists") && !strings.Contains(errStr, "Stream already exists") {
+				// Only log non-duplicate errors
+				p.logger.Debug("failed to open stream for packer", "path", pid, "stream", carrierStreamID, "err", err)
+			}
+			// For duplicate errors, continue silently
+		}
+	}
 
 	// write
 	// assign packet seq
@@ -219,7 +233,7 @@ func (p *Packer) StartRetransmitLoop(resend func(pathID protocol.PathID, seq uin
 						p.metricsMu.Lock()
 						p.droppedCount++
 						p.metricsMu.Unlock()
-						p.logger.Warn("dropping packet after max attempts", "path", pid, "seq", seq)
+						// Silenced: p.logger.Warn("dropping packet after max attempts", "path", pid, "seq", seq)
 						continue
 					}
 					// attempt resend
@@ -248,15 +262,24 @@ func (p *Packer) StartRetransmitLoop(resend func(pathID protocol.PathID, seq uin
 						if backoff > p.maxBackoffMs {
 							backoff = p.maxBackoffMs
 						}
+						// Add some jitter to avoid thundering herd
+						jitter := backoff / 4
+						if jitter > 0 {
+							backoff += int(time.Now().UnixNano() % int64(jitter))
+						}
 						packet.nextRetry = time.Now().Add(time.Duration(backoff) * time.Millisecond)
 					} else {
-						// successful write; set nextRetry to now to allow waiting for ACK
-						packet.nextRetry = time.Now().Add(time.Duration(p.baseBackoffMs) * time.Millisecond)
+						// successful write; wait longer before next retry to allow for ACK
+						waitTime := p.baseBackoffMs * (1 << packet.attempts)
+						if waitTime > p.maxBackoffMs {
+							waitTime = p.maxBackoffMs
+						}
+						packet.nextRetry = time.Now().Add(time.Duration(waitTime) * time.Millisecond)
 					}
 				}
 			}
 			p.mu.Unlock()
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond) // Less aggressive retransmission checking
 		}
 	}()
 }
@@ -293,13 +316,6 @@ func (p *Packer) GetRegisteredPath(pathID protocol.PathID) Path {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.paths[pathID]
-}
-
-// transportPath is an adapter to avoid import cycle with transport.Path interface
-type transportPath interface {
-	PathID() protocol.PathID
-	OpenStream(streamID protocol.StreamID) error
-	WriteStream(streamID protocol.StreamID, b []byte) (int, error)
 }
 
 type pendingPacket struct {

@@ -36,15 +36,20 @@ func NewStream(id protocol.StreamID) *StreamImpl {
 func (s *StreamImpl) Read(p []byte) (int, error) {
 	// If a multiplexer is configured, pull ordered frames from it.
 	if mx := transport.GetDefaultMultiplexer(); mx != nil {
-		data, err := mx.PullFrames(s.id, len(p))
-		if err != nil {
-			return 0, err
+		// Block until we have data or timeout
+		for {
+			data, err := mx.PullFrames(s.id, len(p))
+			if err != nil {
+				return 0, err
+			}
+			if len(data) > 0 {
+				n := copy(p, data)
+				return n, nil
+			}
+			// No data available, wait a bit before trying again
+			// This prevents busy waiting while allowing reads to eventually succeed
+			time.Sleep(10 * time.Millisecond)
 		}
-		if len(data) == 0 {
-			return 0, nil
-		}
-		n := copy(p, data)
-		return n, nil
 	}
 
 	// Fallback: no multiplexer, do simple per-path read
@@ -173,37 +178,6 @@ func (s *StreamImpl) AddPath(path transport.Path) error {
 		transport.GetDefaultPacker().RegisterPath(path)
 	}
 
-	// start handshake only if this path is client-initiated. Server-accepted
-	// paths will wait for an incoming Handshake and HandshakeResp.
-	if path.IsClient() {
-		if err := path.StartHandshake(); err != nil {
-			s.logger.Warn("path handshake failed, not adding path", "stream", s.id, "path", pid, "err", err)
-			// unregister from packer
-			if transport.GetDefaultPacker() != nil {
-				transport.GetDefaultPacker().UnregisterPath(pid)
-			}
-			return err
-		}
-	} else {
-		// server-side path: wait a short time for session to become ready
-		// (StartHandshake will be triggered by remote client). Poll with timeout.
-		waited := 0
-		for waited < 2000 { // 2s total
-			if path.IsSessionReady() {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-			waited += 100
-		}
-		if !path.IsSessionReady() {
-			s.logger.Warn("server-side path did not reach session ready state", "stream", s.id, "path", pid)
-			if transport.GetDefaultPacker() != nil {
-				transport.GetDefaultPacker().UnregisterPath(pid)
-			}
-			return protocol.NewHandshakeFailedError(pid)
-		}
-	}
-
 	// now finalize registration under lock
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -212,6 +186,13 @@ func (s *StreamImpl) AddPath(path transport.Path) error {
 		return protocol.NewInvalidPathIDError(pid)
 	}
 	s.paths[pid] = path
+
+	// If this is the first path added, make it the primary path
+	if s.primaryPathID == 0 {
+		s.primaryPathID = pid
+		s.logger.Debug("Set primary path for stream", "streamID", s.id, "pathID", pid)
+	}
+
 	s.logger.Debug("Added path to stream", "streamID", s.id, "pathID", pid)
 	// ensure a default multiplexer exists (lazy init)
 	if transport.GetDefaultMultiplexer() == nil {

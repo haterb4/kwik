@@ -26,24 +26,15 @@ type ServerSession struct {
 var _ Session = (*ServerSession)(nil)
 
 func NewServerSession(id protocol.SessionID, conn *quic.Conn) *ServerSession {
+	lg := logger.NewLogger(logger.LogLevelDebug).WithComponent("SERVER_SESSION_FACTORY")
+	lg.Debug("Creating new ServerSession...")
 	pathMgr := transport.NewServerPathManager()
 	pathid, err := pathMgr.AccpetPath(conn)
 	if err != nil {
 		panic(err)
 	}
 	pathMgr.SetPrimaryPath(pathid)
-	// ensure default packer/multiplexer exist for this process
-	if transport.GetDefaultPacker() == nil {
-		pk := transport.NewPacker(1200)
-		transport.SetDefaultPacker(pk)
-		// start retransmit loop
-		pk.StartRetransmitLoop(nil)
-	}
-	if transport.GetDefaultMultiplexer() == nil {
-		mx := transport.NewMultiplexer()
-		transport.SetDefaultMultiplexer(mx)
-		mx.StartAckLoop(200)
-	}
+
 	return &ServerSession{
 		id:         id,
 		pathMgr:    pathMgr,
