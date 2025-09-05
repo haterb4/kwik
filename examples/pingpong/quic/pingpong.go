@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
-	"github.com/s-anzie/kwik"
 )
 
 const (
@@ -77,9 +76,8 @@ func generateTLSConfig() *tls.Config {
 
 // Serveur QUIC Ping-Pong
 type PingPongServer struct {
-	listener kwik.Listener
+	listener *quic.Listener
 	addr     string
-	cancel   context.CancelFunc
 }
 
 func NewPingPongServer(addr string) (*PingPongServer, error) {
@@ -89,7 +87,7 @@ func NewPingPongServer(addr string) (*PingPongServer, error) {
 		EnableDatagrams: true,
 	}
 
-	listener, err := kwik.ListenAddr(addr, tlsConf, config)
+	listener, err := quic.ListenAddr(addr, tlsConf, config)
 	if err != nil {
 		return nil, err
 	}
@@ -103,10 +101,9 @@ func NewPingPongServer(addr string) (*PingPongServer, error) {
 func (s *PingPongServer) Start() error {
 	fmt.Printf("🏓 Serveur Ping-Pong QUIC démarré sur %s\n", s.addr)
 	fmt.Println("En attente de connexions...")
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
+
 	for {
-		conn, err := s.listener.Accept(ctx)
+		conn, err := s.listener.Accept(context.Background())
 		if err != nil {
 			return err
 		}
@@ -116,7 +113,7 @@ func (s *PingPongServer) Start() error {
 	}
 }
 
-func (s *PingPongServer) handleConnection(conn kwik.Session) {
+func (s *PingPongServer) handleConnection(conn *quic.Conn) {
 	defer func() {
 		fmt.Printf("🔌 Connexion fermée avec %s\n", conn.RemoteAddr())
 		conn.CloseWithError(0, "Au revoir!")
@@ -129,11 +126,11 @@ func (s *PingPongServer) handleConnection(conn kwik.Session) {
 			return
 		}
 
-		go s.handleStream(stream, conn.RemoteAddr())
+		go s.handleStream(stream, conn.RemoteAddr().String())
 	}
 }
 
-func (s *PingPongServer) handleStream(stream kwik.Stream, clientAddr string) {
+func (s *PingPongServer) handleStream(stream *quic.Stream, clientAddr string) {
 	defer stream.Close()
 
 	var pongCounter uint64 = 0
@@ -176,7 +173,7 @@ func (s *PingPongServer) handleStream(stream kwik.Stream, clientAddr string) {
 	}
 }
 
-func (s *PingPongServer) readMessage(stream kwik.Stream) (*Message, error) {
+func (s *PingPongServer) readMessage(stream *quic.Stream) (*Message, error) {
 	// Lire la taille du message (8 bytes pour uint64)
 	var msgSize uint64
 	err := binary.Read(stream, binary.BigEndian, &msgSize)
@@ -207,7 +204,7 @@ func (s *PingPongServer) readMessage(stream kwik.Stream) (*Message, error) {
 	return msg, nil
 }
 
-func (s *PingPongServer) writeMessage(stream kwik.Stream, msg Message) error {
+func (s *PingPongServer) writeMessage(stream *quic.Stream, msg Message) error {
 	// Préparer le message
 	msgBytes := make([]byte, 20) // 4 + 8 + 8 bytes
 
@@ -233,7 +230,6 @@ func (s *PingPongServer) writeMessage(stream kwik.Stream, msg Message) error {
 
 func (s *PingPongServer) Stop() error {
 	fmt.Println("🛑 Arrêt du serveur...")
-	s.cancel() // annule le ctx => débloque Accept
 	return s.listener.Close()
 }
 
@@ -262,7 +258,7 @@ func (c *PingPongClient) Start() error {
 
 	fmt.Printf("🔗 Connexion au serveur %s...\n", c.serverAddr)
 
-	conn, err := kwik.DialAddr(context.Background(), c.serverAddr, tlsConf, quicConf)
+	conn, err := quic.DialAddr(context.Background(), c.serverAddr, tlsConf, quicConf)
 	if err != nil {
 		return fmt.Errorf("impossible de se connecter: %v", err)
 	}
@@ -325,7 +321,7 @@ func (c *PingPongClient) Start() error {
 	}
 }
 
-func (c *PingPongClient) readMessage(stream kwik.Stream) (*Message, error) {
+func (c *PingPongClient) readMessage(stream *quic.Stream) (*Message, error) {
 	// Même implémentation que le serveur
 	var msgSize uint64
 	err := binary.Read(stream, binary.BigEndian, &msgSize)
@@ -348,7 +344,7 @@ func (c *PingPongClient) readMessage(stream kwik.Stream) (*Message, error) {
 	return msg, nil
 }
 
-func (c *PingPongClient) writeMessage(stream kwik.Stream, msg Message) error {
+func (c *PingPongClient) writeMessage(stream *quic.Stream, msg Message) error {
 	// Même implémentation que le serveur
 	msgBytes := make([]byte, 20)
 	copy(msgBytes[:4], msg.Type)

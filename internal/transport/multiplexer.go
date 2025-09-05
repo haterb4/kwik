@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"sort"
 	"sync"
@@ -45,6 +46,7 @@ type streamQueue struct {
 	gapCount   int64
 	lastGapAt  time.Time
 	lastNackAt time.Time
+	cond       *sync.Cond
 }
 
 func NewMultiplexer(packer *Packer) *Multiplexer {
@@ -423,12 +425,33 @@ func (m *Multiplexer) StartAckLoop(intervalMs int) {
 	}()
 }
 
+func (m *Multiplexer) RegisterStream(streamID protocol.StreamID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Vérifier si elle existe déjà pour éviter de l'écraser
+	if _, ok := m.queues[streamID]; ok {
+		return
+	}
+
+	q := &streamQueue{
+		framesBySeq: make(map[uint64]*protocol.Frame),
+		expectedSeq: 1, // Commencer à attendre la frame 1
+	}
+	q.cond = sync.NewCond(&q.mu)
+	m.queues[streamID] = q
+	m.logger.Debug("registered stream queue in multiplexer", "streamID", streamID)
+}
+
 func (m *Multiplexer) enqueueFrame(f *protocol.Frame) {
 	m.mu.Lock()
 	q, ok := m.queues[f.StreamID]
 	if !ok {
+		// Créer la queue à la volée si elle n'existe pas
 		q = &streamQueue{framesBySeq: make(map[uint64]*protocol.Frame), expectedSeq: 1}
+		q.cond = sync.NewCond(&q.mu)
 		m.queues[f.StreamID] = q
+		m.logger.Debug("created stream queue on-the-fly in enqueue", "streamID", f.StreamID)
 	}
 	m.mu.Unlock()
 
@@ -455,6 +478,7 @@ func (m *Multiplexer) enqueueFrame(f *protocol.Frame) {
 		q.lastGapAt = time.Now()
 		m.logger.Warn("gap detected in stream", "stream", f.StreamID, "expected", q.expectedSeq, "got", f.Seq, "gapCount", q.gapCount)
 		// rate-limit NACKs per-stream
+		/*  =============================================================
 		now := time.Now()
 		if now.Sub(q.lastNackAt) > time.Duration(m.nackCooldownMs)*time.Millisecond {
 			// create ranges covering the missing seqs up to a modest limit
@@ -482,45 +506,76 @@ func (m *Multiplexer) enqueueFrame(f *protocol.Frame) {
 				q.lastNackAt = now
 			}
 		}
+			============================================================= */
 	}
 
 	q.framesBySeq[f.Seq] = f
 	q.mu.Unlock()
+	q.cond.Signal()
 }
 
 // PullFrames returns up to `max` concatenated payload bytes for the requested stream
-// in sequence order starting at the lowest available Seq. It returns zero bytes if
-// no frames are available.
+// in STRICT sequence order. It blocks waiting for missing frames until timeout.
 func (m *Multiplexer) PullFrames(streamID protocol.StreamID, max int) ([]byte, error) {
 	m.mu.RLock()
 	q, ok := m.queues[streamID]
 	m.mu.RUnlock()
+
 	if !ok {
-		return nil, nil
+		m.logger.Error("BUG: PullFrames called for a non-registered stream", "streamID", streamID)
+		return nil, fmt.Errorf("internal error: stream %d not registered in multiplexer", streamID)
 	}
+
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if len(q.framesBySeq) == 0 {
-		return nil, nil
+
+	if q.expectedSeq == 0 {
+		q.expectedSeq = 1
 	}
+
+	// Boucle d'attente : on attend jusqu'à ce que la frame attendue (q.expectedSeq) soit présente.
+	for {
+		if _, ok := q.framesBySeq[q.expectedSeq]; ok {
+			break // La frame est là, on peut continuer.
+		}
+		// La frame n'est pas là. On attend un signal.
+		// Wait() déverrouille atomiquement le mutex et attend, puis le reverrouille au réveil.
+		q.cond.Wait()
+	}
+
 	var out []byte
 	seq := q.expectedSeq
-	// collect contiguous frames starting at expectedSeq
+
+	// On collecte toutes les frames contiguës disponibles.
 	for {
 		f, ok := q.framesBySeq[seq]
 		if !ok {
-			break // gap
-		}
-		if len(out)+len(f.Payload) > max {
+			// Plus de frames contiguës, on s'arrête.
 			break
 		}
+
+		if len(out)+len(f.Payload) > max && len(out) > 0 {
+			// La frame suivante ne rentre pas dans le buffer de lecture et on a déjà des données.
+			break
+		}
+
 		out = append(out, f.Payload...)
 		delete(q.framesBySeq, seq)
 		seq++
+
+		if len(out) >= max {
+			break
+		}
 	}
-	// advance expectedSeq if we consumed frames
-	if seq != q.expectedSeq {
+
+	// Mettre à jour la séquence attendue pour la prochaine lecture.
+	if seq > q.expectedSeq {
+		m.logger.Debug("advanced expected sequence",
+			"stream", streamID,
+			"from", q.expectedSeq,
+			"to", seq)
 		q.expectedSeq = seq
 	}
+
 	return out, nil
 }

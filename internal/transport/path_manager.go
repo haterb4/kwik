@@ -117,8 +117,14 @@ func (pm *pathManagerImpl) RemovePath(id protocol.PathID) {
 
 func (pm *pathManagerImpl) CloseAllPaths() {
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	for _, path := range pm.paths {
-		path.Close()
+	// Close each path and remove it from the map to avoid stale references.
+	for id, path := range pm.paths {
+		if path != nil {
+			if err := path.Close(); err != nil {
+				pm.logger.Debug("error closing path", "pathID", id, "err", err)
+			}
+		}
+		delete(pm.paths, id)
 	}
+	pm.mu.Unlock()
 }

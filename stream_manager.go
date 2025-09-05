@@ -30,12 +30,7 @@ func (m *streamManagerImpl) CreateStream() Stream {
 	streamID := m.nextStreamID
 	m.nextStreamID++
 
-	stream := &StreamImpl{
-		id:            streamID,
-		paths:         make(map[protocol.PathID]transport.Path),
-		logger:        m.logger,
-		streamManager: m,
-	}
+	stream := NewStream(streamID, m)
 
 	m.streams[streamID] = stream
 	m.logger.Debug("Created new stream", "streamID", streamID)
@@ -60,14 +55,7 @@ func (m *streamManagerImpl) AddStreamPath(streamID protocol.StreamID, path trans
 	stream, exists := m.streams[streamID]
 	if !exists {
 		// Create a new stream with this ID
-		stream = &StreamImpl{
-			id:            streamID,
-			paths:         make(map[protocol.PathID]transport.Path),
-			logger:        m.logger,
-			streamManager: m,
-		}
-		stream.paths[path.PathID()] = path
-		m.streams[streamID] = stream
+		return protocol.NewNotExistStreamError(path.PathID(), streamID)
 	} else {
 		// Check if the path is already added to this stream
 		if _, exists := stream.paths[path.PathID()]; exists {

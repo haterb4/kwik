@@ -1,11 +1,10 @@
 package kwik
 
 import (
-	"context"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/s-anzie/kwik/internal/logger"
 	"github.com/s-anzie/kwik/internal/protocol"
@@ -39,49 +38,19 @@ func NewStream(id protocol.StreamID, sm *streamManagerImpl) *StreamImpl {
 // Read implements the io.Reader interface to read data from the stream.
 // It blocks until data is available or an error occurs.
 func (s *StreamImpl) Read(p []byte) (int, error) {
+	s.logger.Info("Read attempt", "streamID", s.id, "bufferSize", len(p))
+
 	if len(p) == 0 {
 		return 0, nil
 	}
 
 	s.mu.RLock()
-	primary := s.primaryPathID
+	primaryPathID := s.primaryPathID
+	path, pathExists := s.paths[primaryPathID]
 	s.mu.RUnlock()
 
-	// Try the primary path first if available
-	if primary != 0 {
-		n, err := s.tryReadFromPath(primary, p)
-		if err == nil {
-			return n, nil
-		}
-		s.logger.Debug("Failed to read from primary path, trying others",
-			"pathID", primary, "error", err)
-	}
-
-	// Try all available paths
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for pid := range s.paths {
-		if pid == primary {
-			continue // Already tried primary
-		}
-		n, err := s.tryReadFromPath(pid, p)
-		if err == nil {
-			s.primaryPathID = pid // Promote this path
-			s.logger.Debug("Promoted path for reading", "pathID", pid)
-			return n, nil
-		}
-		s.logger.Debug("Failed to read from path", "pathID", pid, "error", err)
-	}
-
-	return 0, fmt.Errorf("no available paths for reading")
-}
-
-// tryReadFromPath attempts to read data from a specific path
-func (s *StreamImpl) tryReadFromPath(pid protocol.PathID, p []byte) (int, error) {
-	path, ok := s.GetPath(pid)
-	if !ok {
-		return 0, fmt.Errorf("path not found")
+	if !pathExists {
+		return 0, fmt.Errorf("no primary path for reading on stream %d", s.id)
 	}
 
 	session := path.Session()
@@ -94,30 +63,32 @@ func (s *StreamImpl) tryReadFromPath(pid protocol.PathID, p []byte) (int, error)
 		return 0, fmt.Errorf("no multiplexer for path")
 	}
 
-	// Set a reasonable timeout to prevent hanging indefinitely
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		default:
-			data, err := mx.PullFrames(s.id, len(p))
-			if err != nil {
-				return 0, fmt.Errorf("failed to pull frames: %w", err)
-			}
-			if len(data) > 0 {
-				return copy(p, data), nil
-			}
-			time.Sleep(10 * time.Millisecond) // Yield to other goroutines
-		}
+	// Appel direct à PullFrames qui est maintenant bloquant.
+	data, err := mx.PullFrames(s.id, len(p))
+	if err != nil {
+		s.logger.Error("Read failed on PullFrames", "streamID", s.id, "error", err)
+		return 0, err
 	}
+
+	if len(data) == 0 {
+		// PullFrames peut retourner 0 octets si le stream est fermé.
+		// Pour se conformer à io.Reader, on retourne io.EOF dans ce cas.
+		return 0, io.EOF
+	}
+
+	n := copy(p, data)
+	s.logger.Info("Read succeeded", "streamID", s.id, "read", n)
+	return n, nil
 }
 
 // Write implements the io.Writer interface to write data to the stream.
 // It tries to write to the primary path first, then falls back to other available paths.
 func (s *StreamImpl) Write(p []byte) (int, error) {
+	s.logger.Info("Write attempt",
+		"streamID", s.id,
+		"size", len(p),
+		"primaryPath", s.primaryPathID,
+		"pathCount", len(s.paths))
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -126,15 +97,25 @@ func (s *StreamImpl) Write(p []byte) (int, error) {
 	defer s.mu.RUnlock()
 
 	// Try the primary path first if available
-	if s.primaryPathID != 0 {
-		if path, ok := s.paths[s.primaryPathID]; ok {
-			n, err := s.writeToPath(path, p)
-			if err == nil {
-				return n, nil
-			}
-			s.logger.Debug("Failed to write to primary path, trying others",
-				"pathID", s.primaryPathID, "error", err)
+	if s.primaryPathID <= 0 {
+		return 0, protocol.NewPathNotExistsError(s.primaryPathID)
+	}
+
+	if path, ok := s.paths[s.primaryPathID]; ok {
+		n, err := s.writeToPath(path, p)
+
+		if err != nil {
+			s.logger.Error("Write failed",
+				"streamID", s.id,
+				"error", err,
+				"pathID", s.primaryPathID)
+		} else {
+			s.logger.Info("Write succeeded",
+				"streamID", s.id,
+				"written", n)
 		}
+
+		return n, err
 	}
 	return 0, protocol.NewPathNotExistsError(s.primaryPathID)
 }
@@ -147,7 +128,7 @@ func (s *StreamImpl) writeToPath(path transport.Path, p []byte) (int, error) {
 	}
 
 	pid := path.PathID()
-	s.logger.Debug("Writing to path",
+	s.logger.Debug("1- Writing to path",
 		"streamID", s.id,
 		"pathID", pid,
 		"size", len(p))
@@ -169,6 +150,9 @@ func (s *StreamImpl) writeToPath(path transport.Path, p []byte) (int, error) {
 			"pathID", pid)
 		return 0, fmt.Errorf("no session available for path %d", pid)
 	}
+	s.logger.Debug("2- Using session for path",
+		"streamID", s.id,
+		"pathID", pid)
 
 	packer := session.Packer()
 	if packer == nil {
@@ -177,9 +161,33 @@ func (s *StreamImpl) writeToPath(path transport.Path, p []byte) (int, error) {
 			"pathID", pid)
 		return 0, fmt.Errorf("no packer available for path %d", pid)
 	}
+	s.logger.Debug("3- Using packer for path",
+		"streamID", s.id,
+		"pathID", pid)
 
-	// Submit the frame to the packer
-	if err := packer.SubmitFrame(path, f); err != nil {
+	// SOLUTION POUR DÉBLOQUER L'ARCHITECTURE:
+	// Toujours utiliser SubmitServerFrame pour envoyer immédiatement,
+	// que ce soit côté client ou serveur. SubmitClientFrame cause des problèmes
+	// de synchronisation car il diffère l'envoi des frames, ce qui crée des
+	// interblocages dans les communications bidirectionnelles.
+	var err error
+
+	// Vérifier si le chemin est toujours enregistré dans les chemins du stream
+	_, pathExists := s.GetPath(pid)
+	if !pathExists {
+		s.logger.Error("Path no longer registered with stream",
+			"streamID", s.id,
+			"pathID", pid)
+		return 0, fmt.Errorf("path %d no longer registered with stream %d", pid, s.id)
+	}
+
+	if session := path.Session(); session != nil {
+		err = packer.SubmitFrame(path, f)
+	} else {
+		return 0, fmt.Errorf("no session available")
+	}
+
+	if err != nil {
 		s.logger.Error("Failed to submit frame to packer",
 			"streamID", s.id,
 			"pathID", pid,
@@ -305,11 +313,33 @@ func (s *StreamImpl) AddPath(path transport.Path) error {
 	return nil
 }
 
-// RemovePath detaches a path from this stream. Thread-safe.
-func (s *StreamImpl) RemovePath(pid protocol.PathID) {
+// RemovePath détache un path de ce stream. Thread-safe.
+func (s *StreamImpl) RemovePath(pathID protocol.PathID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.paths, pid)
+
+	// Vérifier si le path existe dans ce stream
+	if _, ok := s.paths[pathID]; !ok {
+		s.logger.Debug("Path not registered with stream, nothing to remove", "streamID", s.id, "pathID", pathID)
+		return
+	}
+
+	// Supprimer le path
+	delete(s.paths, pathID)
+	s.logger.Debug("Removed path from stream", "streamID", s.id, "pathID", pathID)
+
+	// Si c'était le path principal, choisir un autre path comme principal s'il en reste
+	if s.primaryPathID == pathID {
+		// Réinitialiser d'abord
+		s.primaryPathID = 0
+
+		// Choisir le premier path disponible comme nouveau path principal
+		for pid := range s.paths {
+			s.primaryPathID = pid
+			s.logger.Debug("Set new primary path for stream after removal", "streamID", s.id, "pathID", pid)
+			break
+		}
+	}
 }
 
 // GetPath returns the path if present.

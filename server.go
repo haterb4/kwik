@@ -110,7 +110,7 @@ func (s *ServerSession) AcceptStream(ctx context.Context) (Stream, error) {
 		s.logger.Error("Failed to accept stream", "error", err, "pathID", path.PathID())
 		return nil, fmt.Errorf("failed to accept stream: %w", err)
 	}
-
+	s.multiplexer.RegisterStream(stream.StreamID())
 	s.logger.Debug("Creating new stream", "streamID", stream.StreamID(), "pathID", path.PathID())
 	// Add the path to the stream (this will also register with packer)
 	if err := s.streamMgr.AddStreamPath(stream.StreamID(), path); err != nil {
@@ -148,7 +148,7 @@ func (s *ServerSession) OpenStreamSync(ctx context.Context) (Stream, error) {
 	// Create the stream to get an ID
 	streamImpl := s.streamMgr.CreateStream()
 	streamID := streamImpl.StreamID()
-
+	s.multiplexer.RegisterStream(streamID)
 	// Open the stream with the generated ID
 	err := primaryPath.OpenStreamSync(ctx, streamID)
 	if err != nil {
@@ -179,7 +179,7 @@ func (s *ServerSession) OpenStream() (Stream, error) {
 	// Create the stream to get an ID
 	streamImpl := s.streamMgr.CreateStream()
 	streamID := streamImpl.StreamID()
-
+	s.multiplexer.RegisterStream(streamID)
 	// Open the stream with the generated ID
 	err := primaryPath.OpenStream(streamID)
 	if err != nil {
@@ -220,6 +220,9 @@ func (s *ServerSession) SendRawData(data []byte, pathID protocol.PathID, streamI
 func (s *ServerSession) CloseWithError(code int, msg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Log close reason for debugging (who/why closed the session)
+	s.logger.Info("CloseWithError called (server)", "code", code, "msg", msg, "session", s.id, "local", s.localAddr, "remote", s.remoteAddr)
 
 	if s.streamMgr != nil {
 		s.streamMgr.CloseAllStreams()

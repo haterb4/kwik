@@ -15,6 +15,10 @@ type Packer struct {
 	queues        map[protocol.PathID][]*protocol.Frame
 	maxPacketSize int
 	logger        logger.Logger
+	// scheduling for flush
+	flushInterval    time.Duration
+	minFramesForSend int
+	firstEnqueueTime map[protocol.PathID]time.Time
 	// packet sequencing and pending tracking
 	seqMu         sync.Mutex
 	nextPacketSeq map[protocol.PathID]uint64
@@ -34,34 +38,45 @@ type Packer struct {
 }
 
 func NewPacker(maxPacketSize int) *Packer {
-	return &Packer{
-		queues:        make(map[protocol.PathID][]*protocol.Frame),
-		maxPacketSize: maxPacketSize,
-		logger:        logger.NewLogger(logger.LogLevelSilent).WithComponent("PACKER"),
-		nextPacketSeq: make(map[protocol.PathID]uint64),
-		pending:       make(map[protocol.PathID]map[uint64]*pendingPacket),
-		paths:         make(map[protocol.PathID]Path),
+	p := &Packer{
+		queues:           make(map[protocol.PathID][]*protocol.Frame),
+		maxPacketSize:    maxPacketSize,
+		logger:           logger.NewLogger(logger.LogLevelDebug).WithComponent("PACKER"),
+		nextPacketSeq:    make(map[protocol.PathID]uint64),
+		pending:          make(map[protocol.PathID]map[uint64]*pendingPacket),
+		paths:            make(map[protocol.PathID]Path),
+		flushInterval:    20 * time.Millisecond,
+		minFramesForSend: 2,
+		firstEnqueueTime: make(map[protocol.PathID]time.Time),
 		// improved defaults for better reliability
 		maxAttempts:   8,    // More attempts before giving up
 		baseBackoffMs: 250,  // Higher base backoff for QUIC
 		maxBackoffMs:  5000, // Higher max backoff
 	}
+	return p
 }
 
 // SubmitFrame queues a frame for the given path and attempts to assemble a packet
 // containing as many whole frames as possible (without splitting frames) up to
 // maxPacketSize. The assembled packet is written to the quic stream corresponding
 // to the first frame's StreamID.
+// SubmitFrame dispatches to the client or server submitter depending on path role.
+
 func (p *Packer) SubmitFrame(path Path, f *protocol.Frame) error {
 	pid := path.PathID()
+
+	p.logger.Debug("SubmitFrame enter", "path", pid, "stream", f.StreamID, "payload_len", len(f.Payload))
+
 	p.mu.Lock()
 	p.queues[pid] = append(p.queues[pid], f)
+	p.logger.Debug("SubmitFrame queued", "path", pid, "queue_len", len(p.queues[pid]))
+
 	frames := p.queues[pid]
 	var buf bytes.Buffer
 	var assembled []*protocol.Frame
 	size := 0
+
 	for _, fr := range frames {
-		// encoded size: 1 + 8 + 8 + 4 + payload
 		encSize := 1 + 8 + 8 + 4 + len(fr.Payload)
 		if encSize > p.maxPacketSize {
 			p.mu.Unlock()
@@ -77,13 +92,26 @@ func (p *Packer) SubmitFrame(path Path, f *protocol.Frame) error {
 		size += encSize
 		assembled = append(assembled, fr)
 	}
+
 	if len(assembled) == 0 {
+		p.logger.Debug("SubmitFrame no frames assembled", "path", pid)
 		p.mu.Unlock()
 		return nil
 	}
-	// remove assembled frames from queue
+
+	// remove assembled frames from queue now that we're sending
 	p.queues[pid] = frames[len(assembled):]
+	if len(p.queues[pid]) == 0 {
+		delete(p.firstEnqueueTime, pid)
+	}
 	p.mu.Unlock()
+
+	// log assembled summary
+	totalPayload := 0
+	for _, af := range assembled {
+		totalPayload += len(af.Payload)
+	}
+	p.logger.Debug("SubmitFrame assembled", "path", pid, "assembled_frames", len(assembled), "total_payload", totalPayload, "encoded_size", size)
 
 	// write length-prefixed packet body to path. use first frame's StreamID as carrier
 	packet := buf.Bytes()
@@ -93,49 +121,64 @@ func (p *Packer) SubmitFrame(path Path, f *protocol.Frame) error {
 
 	// ensure the target quic stream exists on the path
 	carrierStreamID := assembled[0].StreamID
-	
-	// For non-control streams, ensure the stream exists
+
 	if carrierStreamID != protocol.StreamID(0) {
-		// First check if stream already exists to avoid unnecessary OpenStream calls
 		if stream, ok := path.(interface{ HasStream(protocol.StreamID) bool }); ok {
 			if !stream.HasStream(carrierStreamID) {
-				// Only try to open if stream doesn't exist
 				if err := path.OpenStream(carrierStreamID); err != nil {
 					p.logger.Debug("failed to open stream for packer", "path", pid, "stream", carrierStreamID, "err", err)
-					// Continue anyway as the stream might have been created by a concurrent operation
 				}
 			}
 		} else {
-			// Fallback to always trying to open if we can't check existence
 			if err := path.OpenStream(carrierStreamID); err != nil {
 				p.logger.Debug("failed to open stream for packer", "path", pid, "stream", carrierStreamID, "err", err)
 			}
 		}
 	}
 
-	// write
-	// assign packet seq
+	p.mu.Lock()
+	_, pathExists := p.paths[pid]
+	p.mu.Unlock()
+
+	if !pathExists {
+		p.logger.Warn("Skipping write to unregistered path", "path", pid)
+		return protocol.NewPathNotExistsError(pid)
+	}
+
 	p.seqMu.Lock()
 	seq := p.nextPacketSeq[pid] + 1
 	p.nextPacketSeq[pid] = seq
 	p.seqMu.Unlock()
 
-	// store pending packet
+	p.logger.Debug("SubmitFrame assigned seq", "path", pid, "seq", seq)
+
 	p.mu.Lock()
 	if _, ok := p.pending[pid]; !ok {
 		p.pending[pid] = make(map[uint64]*pendingPacket)
 	}
-	// store packet body (without 4-byte length prefix) but we will send len prefix + seq
 	packetBody := packet
 	p.pending[pid][seq] = &pendingPacket{body: packetBody, carrier: carrierStreamID}
+	pendingCount := len(p.pending[pid])
 	p.mu.Unlock()
 
-	// final wire layout: 8-byte packetSeq + 4-byte len + packetBody
+	p.logger.Debug("SubmitFrame stored pending", "path", pid, "seq", seq, "pending_count", pendingCount)
+
 	var seqBuf [8]byte
 	binary.BigEndian.PutUint64(seqBuf[:], seq)
 	outWithSeq := append(seqBuf[:], out...)
 
+	p.logger.Debug("submit packet", "path", pid, "frames", len(assembled), "seq", seq, "size", len(outWithSeq), "carrier", carrierStreamID)
+
+	start := time.Now()
 	_, err := path.WriteStream(carrierStreamID, outWithSeq)
+	dur := time.Since(start)
+
+	if err != nil {
+		p.logger.Warn("write returned error (submit)", "path", pid, "seq", seq, "dur_ms", dur.Milliseconds(), "err", err)
+	} else {
+		p.logger.Debug("write returned ok (submit)", "path", pid, "seq", seq, "dur_ms", dur.Milliseconds())
+	}
+
 	if err != nil {
 		p.logger.Error("failed to write packet", "path", pid, "err", err)
 		return err
@@ -216,8 +259,16 @@ func (p *Packer) GetMetrics() MetricsSnapshot {
 // StartRetransmitLoop periodically resends unacked packets using the provided resend function.
 func (p *Packer) StartRetransmitLoop(resend func(pathID protocol.PathID, seq uint64, packet []byte) error) {
 	go func() {
-		// naive loop
 		for {
+			type task struct {
+				pathID  protocol.PathID
+				seq     uint64
+				body    []byte
+				carrier protocol.StreamID
+			}
+			var tasks []task
+
+			// collect tasks under lock
 			p.mu.Lock()
 			for pid, mp := range p.pending {
 				for seq, packet := range mp {
@@ -226,26 +277,13 @@ func (p *Packer) StartRetransmitLoop(resend func(pathID protocol.PathID, seq uin
 						continue
 					}
 					if packet.attempts >= p.maxAttempts {
-						// drop
 						delete(mp, seq)
 						p.metricsMu.Lock()
 						p.droppedCount++
 						p.metricsMu.Unlock()
-						// Silenced: p.logger.Warn("dropping packet after max attempts", "path", pid, "seq", seq)
 						continue
 					}
-					// attempt resend
-					var err error
-					if resend != nil {
-						err = resend(pid, seq, packet.body)
-					} else if path, ok := p.paths[pid]; ok {
-						var seqBuf [8]byte
-						binary.BigEndian.PutUint64(seqBuf[:], seq)
-						var lenBuf [4]byte
-						binary.BigEndian.PutUint32(lenBuf[:], uint32(len(packet.body)))
-						out := append(seqBuf[:], append(lenBuf[:], packet.body...)...)
-						_, err = path.WriteStream(packet.carrier, out)
-					}
+					tasks = append(tasks, task{pathID: pid, seq: seq, body: packet.body, carrier: packet.carrier})
 					packet.attempts++
 					p.metricsMu.Lock()
 					if packet.attempts == 1 {
@@ -254,59 +292,83 @@ func (p *Packer) StartRetransmitLoop(resend func(pathID protocol.PathID, seq uin
 						p.resentCount++
 					}
 					p.metricsMu.Unlock()
-					if err != nil {
-						// schedule next retry with exponential backoff
-						backoff := p.baseBackoffMs << (packet.attempts - 1)
-						if backoff > p.maxBackoffMs {
-							backoff = p.maxBackoffMs
-						}
-						// Add some jitter to avoid thundering herd
-						jitter := backoff / 4
-						if jitter > 0 {
-							backoff += int(time.Now().UnixNano() % int64(jitter))
-						}
-						packet.nextRetry = time.Now().Add(time.Duration(backoff) * time.Millisecond)
-					} else {
-						// successful write; wait longer before next retry to allow for ACK
-						waitTime := p.baseBackoffMs * (1 << packet.attempts)
-						if waitTime > p.maxBackoffMs {
-							waitTime = p.maxBackoffMs
-						}
-						packet.nextRetry = time.Now().Add(time.Duration(waitTime) * time.Millisecond)
-					}
 				}
 			}
 			p.mu.Unlock()
-			time.Sleep(500 * time.Millisecond) // Less aggressive retransmission checking
+
+			// execute tasks outside the lock
+			for _, t := range tasks {
+				var err error
+				if resend != nil {
+					err = resend(t.pathID, t.seq, t.body)
+				} else if path, ok := p.paths[t.pathID]; ok {
+					var seqBuf [8]byte
+					binary.BigEndian.PutUint64(seqBuf[:], t.seq)
+					var lenBuf [4]byte
+					binary.BigEndian.PutUint32(lenBuf[:], uint32(len(t.body)))
+					out := append(seqBuf[:], append(lenBuf[:], t.body...)...)
+					_, err = path.WriteStream(t.carrier, out)
+				}
+
+				// update retry schedule under lock
+				p.mu.Lock()
+				if mp, ok := p.pending[t.pathID]; ok {
+					if packet, ok2 := mp[t.seq]; ok2 {
+						if err != nil {
+							backoff := p.baseBackoffMs << (packet.attempts - 1)
+							if backoff > p.maxBackoffMs {
+								backoff = p.maxBackoffMs
+							}
+							jitter := backoff / 4
+							if jitter > 0 {
+								backoff += int(time.Now().UnixNano() % int64(jitter))
+							}
+							packet.nextRetry = time.Now().Add(time.Duration(backoff) * time.Millisecond)
+						} else {
+							waitTime := p.baseBackoffMs * (1 << packet.attempts)
+							if waitTime > p.maxBackoffMs {
+								waitTime = p.maxBackoffMs
+							}
+							packet.nextRetry = time.Now().Add(time.Duration(waitTime) * time.Millisecond)
+						}
+						if packet.attempts >= p.maxAttempts {
+							delete(mp, t.seq)
+							p.metricsMu.Lock()
+							p.droppedCount++
+							p.metricsMu.Unlock()
+						}
+					}
+				}
+				p.mu.Unlock()
+			}
+
+			time.Sleep(500 * time.Millisecond)
 		}
 	}()
+
 }
 
-// RegisterPath allows packer to know about active paths (used by retransmit loop if needed)
+// RegisterPath registers a Path with the Packer for retransmit tracking.
 func (p *Packer) RegisterPath(path Path) {
 	pid := path.PathID()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	
-	// If path is already registered, log and return early
+
 	if _, ok := p.paths[pid]; ok {
 		p.logger.Debug("Path already registered with packer", "pathID", pid)
 		return
 	}
 
-	// Initialize sequence number tracking for this path
 	p.seqMu.Lock()
 	if _, ok := p.nextPacketSeq[pid]; !ok {
 		p.nextPacketSeq[pid] = 0
 	}
 	p.seqMu.Unlock()
 
-	// Initialize pending packets map for this path
 	if _, ok := p.pending[pid]; !ok {
 		p.pending[pid] = make(map[uint64]*pendingPacket)
 	}
 
-	// Register the path
 	p.paths[pid] = path
 	p.logger.Debug("Registered path with packer", "pathID", pid)
 }

@@ -5,6 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +58,7 @@ func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool, session Session
 		isClient:             isClient,
 		streams:              make(map[protocol.StreamID]*quic.Stream),
 		logger:               logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH"),
-		healthIntervalMs:     1000,
+		healthIntervalMs:     15000, // Augmenter à 15 secondes pour réduire le trafic de contrôle
 		healthy:              1,
 		missedPongThreshold:  3,
 		lastAcceptedStreamID: 1,
@@ -129,16 +132,14 @@ func (p *path) IsSessionReady() bool {
 }
 
 func (p *path) OpenStreamSync(ctx context.Context, streamID protocol.StreamID) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	p.logger.Debug("Opening stream synchronously", "pathID", p.id, "streamID", streamID)
 	stream, err := p.conn.OpenStreamSync(ctx)
 	if err != nil {
 		p.logger.Error("Failed to open QUIC stream", "pathID", p.id, "streamID", streamID, "error", err)
 		return err
 	}
-
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if _, ok := p.streams[streamID]; ok {
 		p.logger.Error("Stream already exists", "pathID", p.id, "streamID", streamID)
 		return protocol.NewExistStreamError(p.id, streamID)
@@ -152,16 +153,14 @@ func (p *path) OpenStreamSync(ctx context.Context, streamID protocol.StreamID) e
 }
 
 func (p *path) OpenStream(streamID protocol.StreamID) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	p.logger.Debug("Opening stream asynchronously", "pathID", p.id, "streamID", streamID)
 	stream, err := p.conn.OpenStream()
 	if err != nil {
 		p.logger.Error("Failed to open QUIC stream", "pathID", p.id, "streamID", streamID, "error", err)
 		return err
 	}
-
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if _, ok := p.streams[streamID]; ok {
 		p.logger.Error("Stream already exists", "pathID", p.id, "streamID", streamID)
 		return protocol.NewExistStreamError(p.id, streamID)
@@ -174,33 +173,26 @@ func (p *path) OpenStream(streamID protocol.StreamID) error {
 	return nil
 }
 func (p *path) AcceptStream(ctx context.Context, streamID protocol.StreamID) error {
-	p.mu.Lock()
-	// We don't defer unlock here because we need to unlock before starting the reader
-	// to avoid potential deadlocks in the reader goroutine
-
 	p.logger.Debug("Waiting for new QUIC stream on path", "pathID", p.id)
 	stream, err := p.conn.AcceptStream(ctx)
 	if err != nil {
-		p.mu.Unlock()
 		return err
 	}
 
-	// Use the actual stream ID from QUIC if the provided streamID is 0 (for server-side)
-
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.logger.Debug("Accepted new QUIC stream",
 		"pathID", p.id,
 		"quicStreamID", stream.StreamID(),
 		"logicalStreamID", streamID)
 
 	if _, ok := p.streams[streamID]; ok {
-		p.mu.Unlock()
 		stream.Close()
 		return protocol.NewExistStreamError(p.id, streamID)
 	}
 
 	p.streams[streamID] = stream
 	p.lastAcceptedStreamID = streamID // Update last accepted stream ID
-	p.mu.Unlock()                     // Unlock before starting the reader goroutine
 
 	// Start reader goroutine to forward length-prefixed packets to multiplexer
 	go p.runStreamReader(streamID, stream)
@@ -235,6 +227,7 @@ func (p *path) runStreamReader(streamID protocol.StreamID, s *quic.Stream) {
 		if mx := p.session.Multiplexer(); mx != nil {
 			_ = mx.PushPacketWithSeq(p.id, packetSeq, buf)
 		}
+		runtime.Gosched()
 	}
 }
 
@@ -268,6 +261,29 @@ func (p *path) SendControlFrame(f *protocol.Frame) error {
 	}
 	// write with packetSeq 0
 	_, err := p.WriteStream(protocol.StreamID(0), outWithSeq)
+
+	// Si l'écriture sur le canal de contrôle échoue et que l'erreur indique une fermeture de connexion
+	if err != nil && (strings.Contains(err.Error(), "path closed") ||
+		strings.Contains(err.Error(), "Application error")) {
+		p.logger.Warn("control stream write failed, closing path", "path", p.id, "err", err)
+
+		// Fermer ce path
+		closeErr := p.Close()
+		if closeErr != nil {
+			p.logger.Error("error closing path after control stream failure",
+				"path", p.id, "err", closeErr)
+		}
+
+		// Si c'est le path principal (ID 1), fermer également la session
+		if p.id == protocol.PathID(1) && p.session != nil {
+			p.logger.Warn("primary path control stream failed, closing entire session", "path", p.id)
+			// Utiliser la connexion sous-jacente pour fermer avec erreur
+			if p.conn != nil {
+				p.conn.CloseWithError(0, "primary path control stream failed")
+			}
+		}
+	}
+
 	return err
 }
 
@@ -424,33 +440,211 @@ func (p *path) startHealthLoop() {
 	p.logger.Debug("starting health loop", "path", p.id)
 	ticker := time.NewTicker(time.Duration(p.healthIntervalMs) * time.Millisecond)
 	defer ticker.Stop()
+
+	// Variables pour suivre les erreurs et les succès
+	consecutiveWriteErrors := 0
+	consecutiveSuccesses := 0
+	maxConsecutiveErrors := 5 // Plus tolérant qu'avant (était 3)
+	errorResetThreshold := 3  // Réinitialiser après N succès consécutifs
+
+	// Variables pour la gestion des timeouts adaptatifs
+	baseTimeout := time.Duration(p.healthIntervalMs/2) * time.Millisecond
+	currentTimeout := baseTimeout
+	maxTimeout := time.Duration(p.healthIntervalMs) * time.Millisecond
+
+	// Compteurs pour les statistiques détaillées
+	totalPingsSent := int64(0)
+	totalErrors := int64(0)
+	lastSuccessfulPong := time.Now()
+
 	for range ticker.C {
-		// send ping frame with timestamp payload
+		// Vérifier si le path est encore valide avant d'envoyer un ping
+		if p.conn == nil {
+			p.logger.Debug("connection is nil, stopping health loop", "path", p.id)
+			return
+		}
+
+		// Créer le ping frame avec timestamp
 		ts := time.Now().UnixMilli()
 		var tb [8]byte
 		binary.BigEndian.PutUint64(tb[:], uint64(ts))
-		ping := &protocol.Frame{Type: protocol.FrameTypePing, StreamID: 0, Seq: 0, Payload: tb[:]}
-		if err := p.SendControlFrame(ping); err != nil {
-			// Silenced: p.logger.Warn("failed to send ping", "path", p.id, "err", err)
-			continue
+		ping := &protocol.Frame{
+			Type:     protocol.FrameTypePing,
+			StreamID: 0,
+			Seq:      0,
+			Payload:  tb[:],
 		}
+
+		// Envoyer le ping avec gestion d'erreurs améliorée
+		pingStartTime := time.Now()
+		err := p.SendControlFrame(ping)
+		pingDuration := time.Since(pingStartTime)
+
+		totalPingsSent++
 		atomic.AddInt64(&p.pingsSent, 1)
 
-		// wait half interval, then check if we received a pong recently
-		time.Sleep(time.Duration(p.healthIntervalMs/2) * time.Millisecond)
+		if err != nil {
+			totalErrors++
+
+			// Catégoriser les types d'erreurs
+			isConnectionError := strings.Contains(err.Error(), "path closed") ||
+				strings.Contains(err.Error(), "Application error") ||
+				strings.Contains(err.Error(), "connection closed") ||
+				strings.Contains(err.Error(), "use of closed") ||
+				strings.Contains(err.Error(), "broken pipe")
+
+			isTimeoutError := strings.Contains(err.Error(), "timeout") ||
+				strings.Contains(err.Error(), "deadline exceeded")
+
+			if isConnectionError {
+				consecutiveWriteErrors++
+				consecutiveSuccesses = 0
+				p.logger.Warn("ping failed due to connection issues",
+					"path", p.id,
+					"error", err,
+					"consecutive_errors", consecutiveWriteErrors,
+					"ping_duration_ms", pingDuration.Milliseconds(),
+					"total_pings", totalPingsSent,
+					"total_errors", totalErrors)
+
+				// Fermeture progressive : plus d'erreurs consécutives requises
+				if consecutiveWriteErrors >= maxConsecutiveErrors {
+					p.logger.Error("stopping health loop due to too many consecutive connection errors",
+						"path", p.id,
+						"consecutive_errors", consecutiveWriteErrors,
+						"total_pings", totalPingsSent,
+						"total_errors", totalErrors,
+						"last_successful_pong", time.Since(lastSuccessfulPong))
+
+					// Fermer ce path
+					if err := p.Close(); err != nil {
+						p.logger.Error("failed to close path after too many health check errors",
+							"path", p.id, "close_err", err)
+					}
+
+					// Si c'est le path principal, fermer la session avec plus de contexte
+					if p.id == protocol.PathID(1) && p.session != nil {
+						p.logger.Warn("primary path health check failed, closing entire session",
+							"path", p.id,
+							"consecutive_errors", consecutiveWriteErrors,
+							"session_duration", time.Since(lastSuccessfulPong))
+
+						if p.conn != nil {
+							closeMsg := fmt.Sprintf("primary path health check failed after %d consecutive errors", consecutiveWriteErrors)
+							p.conn.CloseWithError(0, closeMsg)
+						}
+					}
+
+					return
+				}
+
+				// Augmenter temporairement le timeout après une erreur de connexion
+				currentTimeout = time.Duration(float64(currentTimeout) * 1.5)
+				if currentTimeout > maxTimeout {
+					currentTimeout = maxTimeout
+				}
+
+			} else if isTimeoutError {
+				// Les timeouts sont moins graves, ne pas les compter comme erreurs de connexion
+				p.logger.Debug("ping timeout (less critical)",
+					"path", p.id,
+					"error", err,
+					"ping_duration_ms", pingDuration.Milliseconds())
+
+				// Réinitialiser partiellement les succès mais pas complètement
+				if consecutiveSuccesses > 0 {
+					consecutiveSuccesses--
+				}
+
+			} else {
+				// Autres types d'erreurs (moins critiques)
+				p.logger.Debug("ping failed with non-critical error",
+					"path", p.id,
+					"error", err,
+					"ping_duration_ms", pingDuration.Milliseconds())
+
+				// Ne pas incrémenter consecutiveWriteErrors pour les erreurs non-critiques
+				// mais réduire les succès consécutifs
+				if consecutiveSuccesses > 0 {
+					consecutiveSuccesses--
+				}
+			}
+
+		} else {
+			// Ping envoyé avec succès
+			consecutiveSuccesses++
+
+			// Réinitialiser les erreurs après plusieurs succès consécutifs
+			if consecutiveSuccesses >= errorResetThreshold {
+				if consecutiveWriteErrors > 0 {
+					p.logger.Debug("resetting error count after consecutive successes",
+						"path", p.id,
+						"previous_errors", consecutiveWriteErrors,
+						"consecutive_successes", consecutiveSuccesses)
+				}
+				consecutiveWriteErrors = 0
+				consecutiveSuccesses = 0 // Reset aussi les succès pour éviter l'accumulation
+			}
+
+			// Restaurer progressivement le timeout normal
+			if currentTimeout > baseTimeout {
+				currentTimeout = time.Duration(float64(currentTimeout) * 0.9)
+				if currentTimeout < baseTimeout {
+					currentTimeout = baseTimeout
+				}
+			}
+
+			// Log périodique des statistiques (tous les 10 pings réussis)
+			if totalPingsSent%10 == 0 {
+				p.logger.Debug("health check statistics",
+					"path", p.id,
+					"total_pings", totalPingsSent,
+					"total_errors", totalErrors,
+					"error_rate", float64(totalErrors)/float64(totalPingsSent)*100,
+					"consecutive_successes", consecutiveSuccesses,
+					"current_timeout_ms", currentTimeout.Milliseconds())
+			}
+		}
+
+		// Attendre avant de vérifier les pongs (timeout adaptatif)
+		time.Sleep(currentTimeout)
+
+		// Vérifier la réception des pongs
 		last := atomic.LoadInt64(&p.lastPongAtUnixMilli)
-		if last == 0 || (time.Now().UnixMilli()-last) > int64(p.healthIntervalMs) {
-			// missed
+		timeSinceLastPong := time.Now().UnixMilli() - last
+
+		if last == 0 || timeSinceLastPong > int64(p.healthIntervalMs*2) { // Double du délai normal
+			// Pong manqué
 			miss := atomic.AddInt64(&p.missedPongs, 1)
-			// Silenced: p.logger.Warn("missed pong", "path", p.id, "missed", miss)
-			if miss >= int64(p.missedPongThreshold) {
+
+			if miss == 1 {
+				// Premier pong manqué, juste un warning
+				p.logger.Debug("first missed pong", "path", p.id, "time_since_last_ms", timeSinceLastPong)
+			} else if miss >= int64(p.missedPongThreshold) {
+				// Trop de pongs manqués
 				atomic.StoreInt32(&p.healthy, 0)
-				// Silenced: p.logger.Warn("path marked unhealthy", "path", p.id)
+				p.logger.Warn("path marked unhealthy due to missed pongs",
+					"path", p.id,
+					"missed_pongs", miss,
+					"threshold", p.missedPongThreshold,
+					"time_since_last_pong_ms", timeSinceLastPong)
 			}
 		} else {
-			// received pong recently
+			// Pong reçu récemment
+			if atomic.LoadInt64(&p.missedPongs) > 0 {
+				p.logger.Debug("pong received, resetting missed count", "path", p.id)
+			}
 			atomic.StoreInt64(&p.missedPongs, 0)
 			atomic.StoreInt32(&p.healthy, 1)
+			lastSuccessfulPong = time.Now()
+		}
+
+		// Vérification de sécurité : si le path est resté malsain trop longtemps
+		if atomic.LoadInt32(&p.healthy) == 0 && time.Since(lastSuccessfulPong) > time.Duration(p.healthIntervalMs*10)*time.Millisecond {
+			p.logger.Warn("path has been unhealthy for extended period",
+				"path", p.id,
+				"unhealthy_duration_ms", time.Since(lastSuccessfulPong).Milliseconds(),
+				"missed_pongs", atomic.LoadInt64(&p.missedPongs))
 		}
 	}
 }
@@ -519,27 +713,85 @@ func (p *path) GetMetrics() map[string]interface{} {
 
 // ReadStream reads from the stored quic.Stream for the provided streamID.
 func (p *path) ReadStream(streamID protocol.StreamID, b []byte) (int, error) {
+	// Vérifier si le path est en cours de fermeture (évite panic lors de la fermeture)
+	var pathClosed bool
 	p.mu.Lock()
 	s, ok := p.streams[streamID]
+	pathClosed = len(p.streams) == 0 // Si aucun stream, le path est probablement en cours de fermeture
 	p.mu.Unlock()
+
+	// Si le path est en cours de fermeture, retourner une erreur au lieu de paniquer
 	if !ok {
-		return 0, protocol.NewNotExistStreamError(p.id, streamID)
+		if pathClosed {
+			errMsg := fmt.Sprintf("ReadStream: path %d is closing", p.id)
+			p.logger.Warn(errMsg)
+			return 0, fmt.Errorf("path closed: %w", protocol.NewNotExistStreamError(p.id, streamID))
+		} else {
+			// Si ce n'est pas lié à une fermeture du path, déclenchons une panic
+			// car cela indique un problème de cohérence qui doit être corrigé
+			errMsg := fmt.Sprintf("PANIC: ReadStream: stream %d not found in path %d", streamID, p.id)
+			p.logger.Error(errMsg)
+			panic(errMsg)
+		}
 	}
 	return s.Read(b)
 }
 
 // WriteStream writes to the stored quic.Stream for the provided streamID.
 func (p *path) WriteStream(streamID protocol.StreamID, b []byte) (int, error) {
+	// Vérifier si le path est en cours de fermeture (évite panic lors de la fermeture)
+	var pathClosed bool
 	p.mu.Lock()
 	s, ok := p.streams[streamID]
+	pathClosed = len(p.streams) == 0 // Si aucun stream, le path est probablement en cours de fermeture
 	p.mu.Unlock()
-	if !ok {
-		return 0, protocol.NewNotExistStreamError(p.id, streamID)
-	}
-	return s.Write(b)
-}
 
-// HasStream checks if a stream with the given ID exists in this path
+	// Si le path est en cours de fermeture, retourner une erreur au lieu de paniquer
+	if !ok {
+		if pathClosed {
+			errMsg := fmt.Sprintf("WriteStream: path %d is closing", p.id)
+			p.logger.Warn(errMsg)
+			return 0, fmt.Errorf("path closed: %w", protocol.NewNotExistStreamError(p.id, streamID))
+		} else {
+			// Si ce n'est pas lié à une fermeture du path, déclenchons une panic
+			// car cela indique un problème de cohérence qui doit être corrigé
+			errMsg := fmt.Sprintf("PANIC: WriteStream: stream %d not found in path %d", streamID, p.id)
+			p.logger.Error(errMsg)
+			panic(errMsg)
+		}
+	}
+
+	p.logger.Debug("WriteStream: about to write", "path", p.id, "stream", streamID, "len", len(b))
+
+	// Pour éviter les blocages lors de l'écriture, nous effectuons une écriture garantie
+	start := time.Now()
+
+	// Écriture principale
+	n, err := s.Write(b)
+	dur := time.Since(start)
+
+	// En cas d'erreur lors de l'écriture, journaliser et renvoyer l'erreur
+	if err != nil {
+		p.logger.Warn("WriteStream: write returned error", "path", p.id, "stream", streamID, "n", n, "err", err, "dur_ms", dur.Milliseconds())
+	} else {
+		p.logger.Debug("WriteStream: write succeeded", "path", p.id, "stream", streamID, "n", n, "dur_ms", dur.Milliseconds())
+
+		// Pour le serveur, nous voulons nous assurer que les données sont envoyées immédiatement
+		// Nous pouvons envoyer un petit message de synchronisation pour forcer le flush du buffer
+		if !p.isClient && streamID != 0 { // Éviter de faire ceci sur le stream de contrôle
+			// Une écriture vide peut parfois forcer le flush du buffer sous-jacent
+			// C'est une technique qui peut aider à garantir que les données précédentes sont envoyées
+			emptySync := make([]byte, 0) // Message vide pour forcer le flush
+			_, syncErr := s.Write(emptySync)
+			if syncErr != nil {
+				// Une erreur ici n'est pas critique, nous l'enregistrons simplement
+				p.logger.Debug("WriteStream: sync write failed", "path", p.id, "stream", streamID, "err", syncErr)
+			}
+		}
+	}
+
+	return n, err
+} // HasStream checks if a stream with the given ID exists in this path
 func (p *path) HasStream(streamID protocol.StreamID) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -549,17 +801,65 @@ func (p *path) HasStream(streamID protocol.StreamID) bool {
 
 func (p *path) CloseStream(streamID protocol.StreamID) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	stream, ok := p.streams[streamID]
 	if !ok {
+		p.mu.Unlock()
 		return protocol.NewNotExistStreamError(p.id, streamID)
 	}
+
+	// Supprimer le stream du path avant de fermer pour éviter les accès concurrents
 	delete(p.streams, streamID)
+	p.mu.Unlock()
+
+	// Fermer le stream QUIC sous-jacent
 	return stream.Close()
 }
 
 func (p *path) Close() error {
-	return p.conn.CloseWithError(0, "path closed")
+	// Log path closure
+	p.logger.Info("Path Close called", "path", p.id, "local", p.LocalAddr(), "remote", p.RemoteAddr())
+
+	// Synchronisation pour éviter les appels concurrents à Close
+	p.mu.Lock()
+
+	// Vérifier si le path est déjà fermé (streams vides)
+	if len(p.streams) == 0 {
+		p.logger.Debug("path already closed", "path", p.id)
+		p.mu.Unlock()
+		return nil
+	}
+
+	// Unregister path from packer so no further writes are attempted to this path.
+	if p.session != nil {
+		if packer := p.session.Packer(); packer != nil {
+			packer.UnregisterPath(p.id)
+			p.logger.Debug("unregistered path from packer on close", "path", p.id)
+		}
+	}
+
+	// Stocker une copie locale des streams pour les fermer après avoir libéré le mutex
+	streamsCopy := make(map[protocol.StreamID]*quic.Stream)
+	for sid, s := range p.streams {
+		streamsCopy[sid] = s
+		delete(p.streams, sid) // Supprimer immédiatement de la map pour éviter les accès concurrents
+	}
+	p.mu.Unlock()
+
+	// Fermer tous les streams après avoir libéré le mutex pour éviter les deadlocks
+	for sid, s := range streamsCopy {
+		if s != nil {
+			if err := s.Close(); err != nil {
+				p.logger.Debug("error closing stream during path close", "path", p.id, "stream", sid, "err", err)
+			}
+		}
+	}
+
+	// Finally close the underlying QUIC connection
+	if err := p.conn.CloseWithError(0, "path closed"); err != nil {
+		p.logger.Debug("error closing underlying quic connection", "path", p.id, "err", err)
+		return err
+	}
+	return nil
 }
 
 func (p *path) Session() Session {
