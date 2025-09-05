@@ -61,6 +61,14 @@ func (s *ServerSession) Multiplexer() *transport.Multiplexer {
 	return s.multiplexer
 }
 
+func (s *ServerSession) PathManager() transport.PathManager {
+	return s.pathMgr
+}
+
+func (s *ServerSession) StreamManager() streamManager {
+	return s.streamMgr
+}
+
 // listen on the given address with the given TLS and KWIK configurations
 func ListenAddr(address string, tls *tls.Config, cfg *config.Config) (Listener, error) {
 	l, err := listenAddr(address, tls, cfg)
@@ -197,9 +205,9 @@ func (s *ServerSession) OpenStream() (Stream, error) {
 	return streamImpl, nil
 }
 
-func (s *ServerSession) AddPath(address string) error {
-	// Not implemented for server session.
-	return nil
+func (s *ServerSession) AddRelay(address string) (Relay, error) {
+	// Pour le serveur, nous déléguons directement à l'implémentation du path manager
+	return s.pathMgr.AddRelay(address)
 }
 
 func (s *ServerSession) RemovePath(pathID string) error {

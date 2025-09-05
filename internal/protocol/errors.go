@@ -62,7 +62,7 @@ func NewExistStreamError(pathID PathID, streamID StreamID) error {
 	return NewKwikError(ErrDataStreamExists, fmt.Sprintf("failed to create data stream %d on path: %d stream allready exists", streamID, pathID), nil)
 }
 func NewNotExistStreamError(pathID PathID, streamID StreamID) error {
-	return NewKwikError(ErrDataStreamNotExists, fmt.Sprintf("stream not found %d on path: %d stream allready exists", streamID, pathID), nil)
+	return NewKwikError(ErrDataStreamNotExists, fmt.Sprintf("stream %d not found on path: %d", streamID, pathID), nil)
 }
 
 // Handshake and control errors

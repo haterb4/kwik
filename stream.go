@@ -142,6 +142,11 @@ func (s *StreamImpl) writeToPath(path transport.Path, p []byte) (int, error) {
 		Payload:  append([]byte(nil), p...),
 	}
 
+	s.logger.Debug("Using sequence number for frame",
+		"streamID", s.id,
+		"seq", seq,
+		"nextSeq", atomic.LoadUint64(&s.seqCounter)+1)
+
 	// Get the packer from the path's session
 	session := path.Session()
 	if session == nil {
@@ -348,4 +353,16 @@ func (s *StreamImpl) GetPath(pid protocol.PathID) (transport.Path, bool) {
 	defer s.mu.RUnlock()
 	p, ok := s.paths[pid]
 	return p, ok
+}
+
+// SetSeqNumber sets the sequence number to use for the next write operation.
+// After each write, the sequence number will be automatically incremented.
+// This method is thread-safe.
+func (s *StreamImpl) SetSeqNumber(seq uint64) error {
+	atomic.StoreUint64(&s.seqCounter, seq-1) // -1 because the counter will be incremented before use in writeToPath
+	s.logger.Debug("Set sequence number for stream",
+		"streamID", s.id,
+		"newSeq", seq,
+		"nextSeqAfterWrite", seq)
+	return nil
 }

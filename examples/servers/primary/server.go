@@ -88,11 +88,11 @@ func handleConnection(conn kwik.Session) {
 		}
 
 		// Traiter le stream dans une goroutine séparée
-		go handleStream(stream)
+		go handleStream(stream, conn)
 	}
 }
 
-func handleStream(stream kwik.Stream) {
+func handleStream(stream kwik.Stream, session kwik.Session) {
 	defer stream.Close()
 
 	fmt.Printf("Nouveau stream ouvert: %d\n", stream.StreamID())
@@ -112,7 +112,21 @@ func handleStream(stream kwik.Stream) {
 
 		message := string(buffer[:n])
 		fmt.Printf("Message reçu sur stream %d: %s\n", stream.StreamID(), message)
-
+		if message == "connect" {
+			// créer un relay
+			relay, err := session.AddRelay("localhost:4434")
+			if err != nil {
+				fmt.Printf("Erreur création relay: %v\n", err)
+				return
+			}
+			go func() {
+				fmt.Printf("Nouvelle connexion établie vers le relay %d\n", relay.PathID())
+				relay.SendRawData([]byte("Hello from relay!"), stream.StreamID())
+				// Garder le relay ouvert
+				select {}
+			}()
+			continue
+		}
 		// Répondre au client
 		response := fmt.Sprintf("Echo: %s", message)
 		_, err = stream.Write([]byte(response))

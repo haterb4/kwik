@@ -54,7 +54,6 @@ func (m *streamManagerImpl) AddStreamPath(streamID protocol.StreamID, path trans
 	// Get or create the stream
 	stream, exists := m.streams[streamID]
 	if !exists {
-		// Create a new stream with this ID
 		return protocol.NewNotExistStreamError(path.PathID(), streamID)
 	} else {
 		// Check if the path is already added to this stream

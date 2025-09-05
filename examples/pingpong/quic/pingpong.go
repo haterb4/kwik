@@ -328,7 +328,6 @@ func (c *PingPongClient) readMessage(stream *quic.Stream) (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	msgBytes := make([]byte, msgSize)
 	_, err = io.ReadFull(stream, msgBytes)
 	if err != nil {

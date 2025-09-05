@@ -2,76 +2,14 @@ package kwik
 
 import (
 	"context"
-	"time"
 
-	"github.com/s-anzie/kwik/internal/protocol"
 	"github.com/s-anzie/kwik/internal/transport"
 )
 
-// Stream represents a KWIK stream
-type Stream interface {
-	// QUIC-compatible interface
-	Read([]byte) (int, error)
-	Write([]byte) (int, error)
-	Close() error
-
-	// KWIK-specific metadata
-	StreamID() protocol.StreamID
-
-	// Secondary stream isolation methods
-	SetOffset(offset int) error
-	GetOffset() int
-	SetRemoteStreamID(remoteStreamID protocol.StreamID) error
-	RemoteStreamID() protocol.StreamID
-}
-
-type PathStatus int
-
-const (
-	PathStatusActive PathStatus = iota
-	PathStatusDegraded
-	PathStatusDead
-	PathStatusConnecting
-	PathStatusDisconnecting
-)
-
-type PathInfo struct {
-	PathID     string
-	Address    string
-	IsPrimary  bool
-	Status     PathStatus
-	CreatedAt  time.Time
-	LastActive time.Time
-}
-
-// SessionState represents the current state of a session
-type SessionState int
-
-const (
-	SessionStateConnecting SessionState = iota
-	SessionStateAuthenticating
-	SessionStateAuthenticated
-	SessionStateActive
-	SessionStateClosed
-)
-
-// Session represents a KWIK session
-type Session interface {
-	OpenStreamSync(ctx context.Context) (Stream, error)
-	OpenStream() (Stream, error)
-	AcceptStream(ctx context.Context) (Stream, error)
-	AddPath(address string) error
-	RemovePath(pathID string) error
-	LocalAddr() string
-	RemoteAddr() string
-	SessionID() protocol.SessionID
-	SendRawData(data []byte, pathID protocol.PathID, streamID protocol.StreamID) error
-	CloseWithError(code int, msg string) error
-
-	// Transport layer access
-	Packer() *transport.Packer
-	Multiplexer() *transport.Multiplexer
-}
+type Relay = transport.Relay
+type streamManager = transport.StreamManager
+type Session = transport.Session
+type Stream = transport.Stream
 
 // Listener represents a KWIK listener
 type Listener interface {
@@ -79,10 +17,4 @@ type Listener interface {
 	Close() error
 	Addr() string
 	GetActiveSessionCount() int
-}
-type streamManager interface {
-	GetNextStreamID() protocol.StreamID
-	CreateStream() Stream
-	AddStreamPath(streamID protocol.StreamID, path transport.Path) error
-	RemoveStream(streamID protocol.StreamID)
 }

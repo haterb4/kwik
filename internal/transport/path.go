@@ -693,6 +693,135 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 			p.logger.Debug("handshake response channel full or not ready", "path", p.id)
 		}
 		return nil
+	case protocol.FrameTypeAddPath:
+		// Cette trame ne devrait être traitée que côté client
+		if !p.isClient {
+			p.logger.Debug("ignoring AddPath frame on server-side path", "path", p.id)
+			return nil
+		}
+
+		// Décoder l'adresse du chemin à ajouter
+		payload, err := protocol.DecodeAddPathPayload(f.Payload)
+		if err != nil {
+			p.logger.Error("failed to decode AddPath payload", "error", err)
+			return err
+		}
+
+		p.logger.Debug("received AddPath request", "address", payload.Address)
+		pathID, err := p.session.PathManager().OpenPath(context.Background(), payload.Address, p.session)
+		if err != nil {
+			p.logger.Error("failed to open path", "error", err)
+			return err
+		}
+		// Génération d'un nouvel ID de chemin
+		// Nous simulons l'ajout d'un chemin ici puisque l'implémentation réelle nécessiterait
+		// une logique supplémentaire côté serveur
+
+		// Générer un ID pour le nouveau chemin (en utilisant un ID aléatoire pour cet exemple)
+		pathIDBytes := make([]byte, 8)
+		rand.Read(pathIDBytes)
+
+		// Préparer la réponse
+		respPayload := protocol.EncodeAddPathRespPayload(payload.Address, pathID)
+		respFrame := &protocol.Frame{
+			Type:     protocol.FrameTypeAddPathResp,
+			StreamID: 0,
+			Seq:      0,
+			Payload:  respPayload,
+		}
+
+		// Envoyer la réponse
+		p.logger.Debug("sending AddPathResp", "address", payload.Address, "pathID", pathID)
+		return p.SendControlFrame(respFrame)
+
+	case protocol.FrameTypeAddPathResp:
+		// Cette trame ne devrait être traitée que côté serveur qui attend une réponse à sa requête AddPath
+		if p.isClient {
+			p.logger.Debug("ignoring AddPathResp frame on client-side path", "path", p.id)
+			return nil
+		}
+
+		// Transmettre la réponse au path manager
+		// On récupère le path manager depuis la session
+		pm, ok := p.session.PathManager().(*pathManagerImpl)
+		if ok && pm != nil {
+			pm.handleAddPathResp(f)
+		} else {
+			p.logger.Error("path manager not available or not of type *pathManagerImpl")
+		}
+		return nil
+	case protocol.FrameTypeRelayData:
+		// Cette trame ne devrait être traitée que côté client
+		if !p.isClient {
+			p.logger.Debug("ignoring RelayData frame on server-side path", "path", p.id)
+			return nil
+		}
+
+		// Décoder le payload de la trame
+		payload, err := protocol.DecodeRelayDataPayload(f.Payload)
+		if err != nil {
+			p.logger.Error("failed to decode RelayData payload", "error", err)
+			return err
+		}
+
+		p.logger.Debug("received RelayData",
+			"path", p.id,
+			"relayPathID", payload.RelayPathID,
+			"destStreamID", payload.DestStreamID,
+			"dataLen", len(payload.Data))
+
+		// Récupérer le path manager pour obtenir le path correspondant au relayPathID
+		pathMgr := p.session.PathManager()
+		relayPath := pathMgr.GetPath(payload.RelayPathID)
+		if relayPath == nil {
+			p.logger.Error("relay path not found", "relayPathID", payload.RelayPathID)
+			return fmt.Errorf("relay path not found: %d", payload.RelayPathID)
+		}
+
+		// Vérifier si le stream existe déjà dans le path cible
+		hasStream := relayPath.HasStream(payload.DestStreamID)
+		if !hasStream {
+			// Le stream n'existe pas encore sur ce path, nous devons le créer
+			p.logger.Debug("creating new stream on relay path",
+				"relayPathID", payload.RelayPathID,
+				"streamID", payload.DestStreamID)
+
+			// Ouvrir un nouveau stream sur le path cible avec l'ID spécifié
+			err := relayPath.OpenStream(payload.DestStreamID)
+			if err != nil {
+				p.logger.Error("failed to open stream on relay path",
+					"relayPathID", payload.RelayPathID,
+					"streamID", payload.DestStreamID,
+					"error", err)
+				return err
+			}
+
+			// Enregistrer la relation entre le stream et le path dans le StreamManager
+			if err := p.session.StreamManager().AddStreamPath(payload.DestStreamID, relayPath); err != nil {
+				p.logger.Error("failed to register stream path in StreamManager",
+					"relayPathID", payload.RelayPathID,
+					"streamID", payload.DestStreamID,
+					"error", err)
+				return err
+			}
+		}
+
+		// Écrire les données sur le stream du path cible
+		n, err := relayPath.WriteStream(payload.DestStreamID, payload.Data)
+		if err != nil {
+			p.logger.Error("failed to write data to relay stream",
+				"relayPathID", payload.RelayPathID,
+				"streamID", payload.DestStreamID,
+				"error", err)
+			return err
+		}
+
+		p.logger.Debug("wrote data to relay stream",
+			"relayPathID", payload.RelayPathID,
+			"streamID", payload.DestStreamID,
+			"bytesWritten", n)
+
+		return nil
 	default:
 		p.logger.Debug("unknown control frame", "type", f.Type)
 		return nil

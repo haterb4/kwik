@@ -18,6 +18,11 @@ const (
 	FrameTypeHandshakeResp FrameType = 0x5
 	FrameTypePing          FrameType = 0x6
 	FrameTypePong          FrameType = 0x7
+	// Path management frames
+	FrameTypeAddPath     FrameType = 0x8
+	FrameTypeAddPathResp FrameType = 0x9
+	// Relay data frame
+	FrameTypeRelayData FrameType = 0xA
 	// future frame types can be added here
 )
 
@@ -125,4 +130,131 @@ func DecodeAckPayload(b []byte) ([]AckRange, error) {
 		out = append(out, AckRange{Start: start, Count: count})
 	}
 	return out, nil
+}
+
+// AddPathPayload represents the payload of an AddPath frame
+type AddPathPayload struct {
+	Address string
+}
+
+// EncodeAddPathPayload encodes an address into a byte slice for an AddPath frame
+// Format: string length (uint16) followed by address string
+func EncodeAddPathPayload(address string) []byte {
+	var buf bytes.Buffer
+	addrBytes := []byte(address)
+	binary.Write(&buf, binary.BigEndian, uint16(len(addrBytes)))
+	buf.Write(addrBytes)
+	return buf.Bytes()
+}
+
+// DecodeAddPathPayload decodes a byte slice into an AddPathPayload
+func DecodeAddPathPayload(b []byte) (*AddPathPayload, error) {
+	buf := bytes.NewReader(b)
+	var addrLen uint16
+	if err := binary.Read(buf, binary.BigEndian, &addrLen); err != nil {
+		return nil, err
+	}
+
+	addrBytes := make([]byte, addrLen)
+	if _, err := io.ReadFull(buf, addrBytes); err != nil {
+		return nil, err
+	}
+
+	return &AddPathPayload{
+		Address: string(addrBytes),
+	}, nil
+}
+
+// AddPathRespPayload represents the payload of an AddPathResp frame
+type AddPathRespPayload struct {
+	Address string
+	PathID  PathID
+}
+
+// EncodeAddPathRespPayload encodes an address and path ID into a byte slice for an AddPathResp frame
+// Format: path ID (uint64), string length (uint16), address string
+func EncodeAddPathRespPayload(address string, pathID PathID) []byte {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, uint64(pathID))
+
+	addrBytes := []byte(address)
+	binary.Write(&buf, binary.BigEndian, uint16(len(addrBytes)))
+	buf.Write(addrBytes)
+
+	return buf.Bytes()
+}
+
+// DecodeAddPathRespPayload decodes a byte slice into an AddPathRespPayload
+func DecodeAddPathRespPayload(b []byte) (*AddPathRespPayload, error) {
+	buf := bytes.NewReader(b)
+
+	var pathID uint64
+	if err := binary.Read(buf, binary.BigEndian, &pathID); err != nil {
+		return nil, err
+	}
+
+	var addrLen uint16
+	if err := binary.Read(buf, binary.BigEndian, &addrLen); err != nil {
+		return nil, err
+	}
+
+	addrBytes := make([]byte, addrLen)
+	if _, err := io.ReadFull(buf, addrBytes); err != nil {
+		return nil, err
+	}
+
+	return &AddPathRespPayload{
+		Address: string(addrBytes),
+		PathID:  PathID(pathID),
+	}, nil
+}
+
+// RelayDataPayload represents the payload of a RelayData frame
+type RelayDataPayload struct {
+	RelayPathID  PathID
+	DestStreamID StreamID
+	Data         []byte
+}
+
+// EncodeRelayDataPayload encodes a RelayDataPayload into a byte slice
+// Format: relay path ID (uint64), destination stream ID (uint64), data length (uint32), data bytes
+func EncodeRelayDataPayload(relayPathID PathID, destStreamID StreamID, data []byte) []byte {
+	var buf bytes.Buffer
+	binary.Write(&buf, binary.BigEndian, uint64(relayPathID))
+	binary.Write(&buf, binary.BigEndian, uint64(destStreamID))
+	binary.Write(&buf, binary.BigEndian, uint32(len(data)))
+	buf.Write(data)
+
+	return buf.Bytes()
+}
+
+// DecodeRelayDataPayload decodes a byte slice into a RelayDataPayload
+func DecodeRelayDataPayload(b []byte) (*RelayDataPayload, error) {
+	buf := bytes.NewReader(b)
+
+	var pathID uint64
+	if err := binary.Read(buf, binary.BigEndian, &pathID); err != nil {
+		return nil, err
+	}
+
+	var streamID uint64
+	if err := binary.Read(buf, binary.BigEndian, &streamID); err != nil {
+		return nil, err
+	}
+
+	var dataLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &dataLen); err != nil {
+		return nil, err
+	}
+
+	data := make([]byte, dataLen)
+	if _, err := io.ReadFull(buf, data); err != nil {
+		return nil, err
+	}
+
+	return &RelayDataPayload{
+		RelayPathID:  PathID(pathID),
+		DestStreamID: StreamID(streamID),
+		Data:         data,
+	}, nil
 }

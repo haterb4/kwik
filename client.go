@@ -63,6 +63,13 @@ func (s *ClientSession) Multiplexer() *transport.Multiplexer {
 	return s.multiplexer
 }
 
+func (s *ClientSession) PathManager() transport.PathManager {
+	return s.pathMgr
+}
+func (s *ClientSession) StreamManager() streamManager {
+	return s.streamMgr
+}
+
 /*
 =====================================================================================================
 * Client session management
@@ -255,9 +262,9 @@ func (s *ClientSession) OpenStream() (Stream, error) {
 	return stream, nil
 }
 
-func (s *ClientSession) AddPath(address string) error {
+func (s *ClientSession) AddRelay(address string) (transport.Relay, error) {
 	// Not implemented for client session.
-	return nil
+	return nil, fmt.Errorf("AddRelay not implemented for client session")
 }
 
 func (s *ClientSession) RemovePath(pathID string) error {

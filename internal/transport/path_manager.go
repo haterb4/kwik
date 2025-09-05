@@ -3,8 +3,10 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/s-anzie/kwik/internal/config"
@@ -13,13 +15,15 @@ import (
 )
 
 type pathManagerImpl struct {
-	paths         map[protocol.PathID]*path
-	nextPathID    uint64
-	tlsCfg        *tls.Config
-	config        *config.Config
-	primaryPathID protocol.PathID
-	mu            sync.Mutex
-	logger        logger.Logger
+	paths              map[protocol.PathID]*path
+	relays             map[protocol.PathID]*relayImpl
+	nextPathID         uint64
+	tlsCfg             *tls.Config
+	config             *config.Config
+	primaryPathID      protocol.PathID
+	mu                 sync.Mutex
+	logger             logger.Logger
+	addPathRespChannel chan *protocol.AddPathRespPayload
 }
 
 func NewClientPathManager(tls *tls.Config, cfg *config.Config) *pathManagerImpl {
@@ -127,4 +131,100 @@ func (pm *pathManagerImpl) CloseAllPaths() {
 		delete(pm.paths, id)
 	}
 	pm.mu.Unlock()
+}
+
+func (pm *pathManagerImpl) AddRelay(address string) (Relay, error) {
+	pm.mu.Lock()
+	primaryPath := pm.paths[pm.primaryPathID]
+	pm.mu.Unlock()
+
+	if primaryPath == nil {
+		return nil, protocol.NewPathNotExistsError(0)
+	}
+
+	// Create a channel to receive the response
+	responseChannel := make(chan *protocol.AddPathRespPayload, 1)
+
+	// Register a response handler in the path manager
+	pm.registerAddPathRespHandler(responseChannel)
+
+	// 1. Send AddPath frame on primary path
+	payload := protocol.EncodeAddPathPayload(address)
+	frame := &protocol.Frame{
+		Type:     protocol.FrameTypeAddPath,
+		StreamID: 0, // Control stream
+		Seq:      0,
+		Payload:  payload,
+	}
+
+	// Send the frame through the primary path
+	if err := primaryPath.SendControlFrame(frame); err != nil {
+		pm.unregisterAddPathRespHandler()
+		return nil, fmt.Errorf("failed to send AddPath frame: %w", err)
+	}
+
+	pm.logger.Debug("Sent AddPath request", "address", address)
+
+	// 2. Wait for response synchronously
+	select {
+	case response := <-responseChannel:
+		// 3. Create a new relay with the received path ID
+		relay := NewRelay(primaryPath, response.Address, response.PathID)
+
+		// Store the relay in the map
+		pm.mu.Lock()
+		if pm.relays == nil {
+			pm.relays = make(map[protocol.PathID]*relayImpl)
+		}
+		pm.relays[response.PathID] = relay
+		pm.mu.Unlock()
+
+		pm.logger.Debug("Created relay", "address", response.Address, "pathID", response.PathID)
+		return relay, nil
+
+	case <-time.After(10 * time.Second):
+		pm.unregisterAddPathRespHandler()
+		return nil, fmt.Errorf("timeout waiting for AddPathResp")
+	}
+}
+
+// registerAddPathRespHandler registers a channel to receive AddPathResp responses
+func (pm *pathManagerImpl) registerAddPathRespHandler(ch chan *protocol.AddPathRespPayload) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.addPathRespChannel = ch
+}
+
+// unregisterAddPathRespHandler removes the registered channel
+func (pm *pathManagerImpl) unregisterAddPathRespHandler() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.addPathRespChannel = nil
+}
+
+// handleAddPathResp processes an AddPathResp frame and forwards it to the registered channel
+func (pm *pathManagerImpl) handleAddPathResp(frame *protocol.Frame) {
+	pm.mu.Lock()
+	respChannel := pm.addPathRespChannel
+	pm.mu.Unlock()
+
+	if respChannel == nil {
+		pm.logger.Warn("Received AddPathResp but no handler registered")
+		return
+	}
+
+	// Decode the response
+	resp, err := protocol.DecodeAddPathRespPayload(frame.Payload)
+	if err != nil {
+		pm.logger.Error("Failed to decode AddPathResp", "error", err)
+		return
+	}
+
+	// Send to the waiting handler
+	select {
+	case respChannel <- resp:
+		pm.logger.Debug("Forwarded AddPathResp", "address", resp.Address, "pathID", resp.PathID)
+	default:
+		pm.logger.Warn("AddPathResp handler channel is full")
+	}
 }
