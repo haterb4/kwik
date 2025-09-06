@@ -124,7 +124,7 @@ func handleSession(session kwik.Session) {
 		command := fmt.Sprintf("SEND %s %d %d %d %d", fileName, chunkSize, 1, totalChunks, 2) // start at chunk 1, step 2
 
 		// Le stream ID est déjà connu du contexte de la session du relais
-		relay.SendRawData([]byte(command), 0) // StreamID 0 car le relais ouvrira son propre stream
+		relay.SendRawData([]byte(command), stream.StreamID()) // StreamID 0 car le relais ouvrira son propre stream
 	}()
 
 	// Send even chunks

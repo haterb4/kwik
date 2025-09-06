@@ -47,11 +47,11 @@ func NewClientSession(address string, tls *tls.Config, cfg *config.Config) *Clie
 		id:          0,
 		remoteAddr:  address,
 		pathMgr:     mgr,
-		streamMgr:   NewStreamManager(),
 		logger:      logger.NewLogger(logger.LogLevelSilent).WithComponent("CLIENT_SESSION"),
 		packer:      packer,
 		multiplexer: multiplexer,
 	}
+	sess.streamMgr = NewStreamManager(sess)
 	return sess
 }
 

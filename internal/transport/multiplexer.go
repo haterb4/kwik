@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bytes"
+	"container/heap"
 	"fmt"
 	"io"
 	"sort"
@@ -11,6 +12,27 @@ import (
 	"github.com/s-anzie/kwik/internal/logger"
 	"github.com/s-anzie/kwik/internal/protocol"
 )
+
+// Item dans le tas du multiplexeur. Contient une trame prête à être lue.
+type readyFrame struct {
+	frame  *protocol.Frame
+	pathID protocol.PathID
+}
+
+// Un tas de trames prêtes, triées par Offset.
+type readyFrameHeap []readyFrame
+
+func (h readyFrameHeap) Len() int            { return len(h) }
+func (h readyFrameHeap) Less(i, j int) bool  { return h[i].frame.Offset < h[j].frame.Offset }
+func (h readyFrameHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *readyFrameHeap) Push(x interface{}) { *h = append(*h, x.(readyFrame)) }
+func (h *readyFrameHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
 
 // multiplexer collects packets from multiple paths concurrently, unpacks
 // frames and delivers ordered frames to per-stream queues.
@@ -36,17 +58,22 @@ type Multiplexer struct {
 	nackSentCount int64
 	packer        *Packer
 }
+type pathQueue struct {
+	mu              sync.Mutex
+	frames          map[uint64]*protocol.Frame // Trames non ordonnées, clé = Seq
+	nextReadSeq     uint64                     // Le prochain Seq que nous attendons sur ce path
+	readyForPulling *readyFrameHeap            // Un tas partagé pour placer les trames ordonnées
+	parentCond      *sync.Cond                 // Le cond du streamQueue parent, pour signaler
+}
 
 type streamQueue struct {
-	mu          sync.Mutex
-	framesBySeq map[uint64]*protocol.Frame
-	// next expected sequence number for this stream
-	expectedSeq uint64
-	// gap and nack metrics
-	gapCount   int64
-	lastGapAt  time.Time
-	lastNackAt time.Time
-	cond       *sync.Cond
+	mu             sync.Mutex
+	cond           *sync.Cond
+	paths          map[protocol.PathID]*pathQueue
+	readyFrames    *readyFrameHeap // Tas de trames prêtes à être lues, ordonnées par Offset
+	nextReadOffset int64
+	buffer         []byte
+	isClosed       bool
 }
 
 func NewMultiplexer(packer *Packer) *Multiplexer {
@@ -64,63 +91,12 @@ func NewMultiplexer(packer *Packer) *Multiplexer {
 		packer:                     packer,
 	}
 }
-
-// PushPacket accepts a raw packet (which is prefixed by 4-byte length when serialized
-// on the wire). We assume callers pass the packet body (not the 4-byte len).
-func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
-	// unpack: sequence of frames
-	buf := bytes.NewReader(pkt)
-	for {
-		if buf.Len() == 0 {
-			break
-		}
-		f, err := protocol.DecodeFrame(buf)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			m.logger.Error("failed to decode frame", "path", pathID, "err", err)
-			return err
-		}
-		// if this is a control frame (stream 0), route to the path's control handler
-		if f.StreamID == 0 {
-			// handle ACK frames specially
-			if f.Type == protocol.FrameTypeAck {
-				ranges, err := protocol.DecodeAckPayload(f.Payload)
-				if err != nil {
-					m.logger.Error("failed to decode ack payload", "err", err)
-				} else {
-					if m.packer != nil {
-						m.packer.OnAck(pathID, ranges)
-					}
-				}
-				continue
-			}
-			// handle NACK frames: request resend of ranges
-			if f.Type == protocol.FrameTypeNack {
-				ranges, err := protocol.DecodeAckPayload(f.Payload)
-				if err != nil {
-					m.logger.Error("failed to decode nack payload", "err", err)
-				} else {
-					if m.packer != nil {
-						// instruct packer to resend those ranges on this path
-						m.packer.ResendRanges(pathID, ranges)
-					}
-				}
-				continue
-			}
-
-			// other control frames: try to deliver to registered path's control handler
-			if path := m.packer.GetRegisteredPath(pathID); path != nil {
-				// best effort; ignore errors
-				_ = path.HandleControlFrame(f)
-				continue
-			}
-			// fallback: if no path handler, fall through to enqueue (unlikely)
-		}
-		m.enqueueFrame(f)
+func (m *Multiplexer) SetStreamNextStreamOffset(id protocol.StreamID, offset int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sq, ok := m.queues[id]; ok {
+		sq.nextReadOffset = offset
 	}
-	return nil
 }
 
 // PushPacketWithSeq accepts a packet along with its sequence number.
@@ -187,7 +163,7 @@ func (m *Multiplexer) PushPacketWithSeq(pathID protocol.PathID, packetSeq uint64
 			}
 		}
 
-		m.enqueueFrame(f)
+		m.enqueueFrame(f, pathID)
 	}
 	return nil
 }
@@ -217,10 +193,17 @@ func (m *Multiplexer) sendAckNow(pid protocol.PathID) {
 	if len(ranges) == 0 {
 		return
 	}
-	payload := protocol.EncodeAckPayload(ranges)
-	ackFrame := &protocol.Frame{Type: protocol.FrameTypeAck, StreamID: 0, Seq: 0, Payload: payload}
+
 	if m.packer != nil {
 		if path := m.packer.GetRegisteredPath(pid); path != nil {
+			payload := protocol.EncodeAckPayload(ranges)
+			seq, _ := path.WriteSeq(0)
+			ackFrame := &protocol.Frame{
+				Type:     protocol.FrameTypeAck,
+				StreamID: 0,
+				Seq:      seq,
+				Payload:  payload,
+			}
 			_ = m.packer.SubmitFrame(path, ackFrame)
 			m.metricsMu.Lock()
 			m.ackSentCount++
@@ -268,7 +251,6 @@ func (m *Multiplexer) sendNackRanges(ranges []protocol.AckRange) {
 		}
 	}
 	payload := protocol.EncodeAckPayload(ranges)
-	nackFrame := &protocol.Frame{Type: protocol.FrameTypeNack, StreamID: 0, Seq: 0, Payload: payload}
 	if m.packer == nil {
 		m.logger.Warn("no packer available for NACK")
 		return
@@ -283,6 +265,8 @@ func (m *Multiplexer) sendNackRanges(ranges []protocol.AckRange) {
 	for _, pid := range paths {
 		if path := m.packer.GetRegisteredPath(pid); path != nil {
 			// submit via packer
+			seq, _ := path.WriteSeq(0)
+			nackFrame := &protocol.Frame{Type: protocol.FrameTypeNack, StreamID: 0, Seq: seq, Payload: payload}
 			if err := m.packer.SubmitFrame(path, nackFrame); err != nil {
 				m.logger.Warn("failed to submit nack frame", "path", pid, "err", err)
 			} else {
@@ -316,12 +300,13 @@ func (m *Multiplexer) sendNackRangesToPath(pid protocol.PathID, ranges []protoco
 		}
 	}
 	payload := protocol.EncodeAckPayload(ranges)
-	nackFrame := &protocol.Frame{Type: protocol.FrameTypeNack, StreamID: 0, Seq: 0, Payload: payload}
 	if m.packer == nil {
 		m.logger.Warn("no packer available for NACK")
 		return
 	}
 	if path := m.packer.GetRegisteredPath(pid); path != nil {
+		seq, _ := path.WriteSeq(0)
+		nackFrame := &protocol.Frame{Type: protocol.FrameTypeNack, StreamID: 0, Seq: seq, Payload: payload}
 		if err := m.packer.SubmitFrame(path, nackFrame); err != nil {
 			m.logger.Warn("failed to submit nack frame", "path", pid, "err", err)
 		} else {
@@ -390,16 +375,17 @@ func (m *Multiplexer) StartAckLoop(intervalMs int) {
 				}
 				// prepare ack frame payload
 				payload := protocol.EncodeAckPayload(ranges)
-				ackFrame := &protocol.Frame{
-					Type:     protocol.FrameTypeAck,
-					StreamID: protocol.StreamID(0), // control stream
-					Seq:      0,
-					Payload:  payload,
-				}
 				// send via packer on same path
 				if m.packer != nil {
 					if path := m.packer.GetRegisteredPath(pid); path != nil {
 						// submit ack frame
+						seq, _ := path.WriteSeq(0)
+						ackFrame := &protocol.Frame{
+							Type:     protocol.FrameTypeAck,
+							StreamID: protocol.StreamID(0), // control stream
+							Seq:      seq,
+							Payload:  payload,
+						}
 						_ = m.packer.SubmitFrame(path, ackFrame)
 						// clear recorded receipts that we acked
 						m.mu.Lock()
@@ -428,154 +414,129 @@ func (m *Multiplexer) StartAckLoop(intervalMs int) {
 func (m *Multiplexer) RegisterStream(streamID protocol.StreamID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	// Vérifier si elle existe déjà pour éviter de l'écraser
 	if _, ok := m.queues[streamID]; ok {
 		return
 	}
-
+	rfh := make(readyFrameHeap, 0)
+	heap.Init(&rfh)
 	q := &streamQueue{
-		framesBySeq: make(map[uint64]*protocol.Frame),
-		expectedSeq: 1, // Commencer à attendre la frame 1
+		paths:          make(map[protocol.PathID]*pathQueue),
+		readyFrames:    &rfh,
+		nextReadOffset: 0,
 	}
 	q.cond = sync.NewCond(&q.mu)
 	m.queues[streamID] = q
-	m.logger.Debug("registered stream queue in multiplexer", "streamID", streamID)
+	m.logger.Debug("Registered new streamQueue", "streamID", streamID)
 }
 
-func (m *Multiplexer) enqueueFrame(f *protocol.Frame) {
-	m.mu.Lock()
-	q, ok := m.queues[f.StreamID]
+// enqueueFrame ajoute une trame à la bonne file d'attente de path.
+func (m *Multiplexer) enqueueFrame(frame *protocol.Frame, pathID protocol.PathID) {
+	m.mu.RLock()
+	sq, ok := m.queues[frame.StreamID]
+	m.mu.RUnlock()
 	if !ok {
-		// Créer la queue à la volée si elle n'existe pas
-		q = &streamQueue{framesBySeq: make(map[uint64]*protocol.Frame), expectedSeq: 1}
-		q.cond = sync.NewCond(&q.mu)
-		m.queues[f.StreamID] = q
-		m.logger.Debug("created stream queue on-the-fly in enqueue", "streamID", f.StreamID)
-	}
-	m.mu.Unlock()
-
-	q.mu.Lock()
-	// initialize expectedSeq if zero
-	if q.expectedSeq == 0 {
-		q.expectedSeq = 1
-	}
-	// drop duplicates or old frames
-	if f.Seq < q.expectedSeq {
-		q.mu.Unlock()
-		// Silenced: m.logger.Debug("dropping old/duplicate frame", "stream", f.StreamID, "seq", f.Seq, "expected", q.expectedSeq)
-		return
-	}
-	if _, exists := q.framesBySeq[f.Seq]; exists {
-		q.mu.Unlock()
-		// Silenced: m.logger.Debug("duplicate frame ignored", "stream", f.StreamID, "seq", f.Seq)
+		m.logger.Warn("Frame for unregistered stream", "streamID", frame.StreamID)
 		return
 	}
 
-	// detect gap: if frame seq > expectedSeq then we have a gap
-	if f.Seq > q.expectedSeq {
-		q.gapCount++
-		q.lastGapAt = time.Now()
-		m.logger.Warn("gap detected in stream", "stream", f.StreamID, "expected", q.expectedSeq, "got", f.Seq, "gapCount", q.gapCount)
-		// rate-limit NACKs per-stream
-		/*  =============================================================
-		now := time.Now()
-		if now.Sub(q.lastNackAt) > time.Duration(m.nackCooldownMs)*time.Millisecond {
-			// create ranges covering the missing seqs up to a modest limit
-			// we request from expectedSeq to f.Seq-1
-			start := q.expectedSeq
-			count := uint32(0)
-			if f.Seq > q.expectedSeq {
-				gap := f.Seq - q.expectedSeq
-				if gap > m.nackMaxTotalSeqs {
-					gap = m.nackMaxTotalSeqs
-				}
-				count = uint32(gap)
-			}
-			if count > 0 {
-				ranges := []protocol.AckRange{{Start: start, Count: count}}
-				// prefer targeting NACK to last-seen path for this stream
-				m.mu.RLock()
-				targetPath, ok := m.lastSeenPathForStream[f.StreamID]
-				m.mu.RUnlock()
-				if ok {
-					go m.sendNackRangesToPath(targetPath, ranges)
-				} else {
-					go m.sendNackRanges(ranges)
-				}
-				q.lastNackAt = now
-			}
+	sq.mu.Lock()
+	pq, ok := sq.paths[pathID]
+	if !ok {
+		// Créer la file d'attente pour ce path si elle n'existe pas.
+		pq = &pathQueue{
+			frames:          make(map[uint64]*protocol.Frame),
+			nextReadSeq:     1, // On s'attend à ce que le Seq commence à 1
+			readyForPulling: sq.readyFrames,
+			parentCond:      sq.cond,
 		}
-			============================================================= */
+		sq.paths[pathID] = pq
+	}
+	sq.mu.Unlock()
+
+	// Maintenant, on travaille sur la file d'attente du path.
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	// Ignorer les vieilles trames.
+	if frame.Seq < pq.nextReadSeq {
+		m.logger.Debug("Dropping old frame on path", "streamID", frame.StreamID, "pathID", pathID, "seq", frame.Seq)
+		return
+	}
+	m.logger.Debug("Enqueuing frame", "streamID", frame.StreamID, "pathID", pathID, "seq", frame.Seq, "offset", frame.Offset, "len", len(frame.Payload))
+	// Stocker la trame.
+	pq.frames[frame.Seq] = frame
+
+	// Processus de ré-ordonnancement par Seq.
+	// On ajoute au tas 'readyFrames' toutes les trames contiguës qu'on peut.
+	for {
+		nextFrame, found := pq.frames[pq.nextReadSeq]
+		if !found {
+			break // On a un trou, on arrête.
+		}
+
+		// On a la prochaine trame en séquence.
+		sq.mu.Lock()
+		heap.Push(sq.readyFrames, readyFrame{frame: nextFrame, pathID: pathID})
+		sq.mu.Unlock()
+
+		delete(pq.frames, pq.nextReadSeq)
+		pq.nextReadSeq++
 	}
 
-	q.framesBySeq[f.Seq] = f
-	q.mu.Unlock()
-	q.cond.Signal()
+	// Signaler à PullFrames qu'il y a potentiellement de nouvelles données prêtes.
+	pq.parentCond.Signal()
 }
 
 // PullFrames returns up to `max` concatenated payload bytes for the requested stream
-// in STRICT sequence order. It blocks waiting for missing frames until timeout.
-func (m *Multiplexer) PullFrames(streamID protocol.StreamID, max int) ([]byte, error) {
+// in order of increasing offset, from any available path.
+// PullFrames est la logique de lecture finale.
+func (m *Multiplexer) PullFrames(streamID protocol.StreamID, p []byte) (int, error) {
 	m.mu.RLock()
-	q, ok := m.queues[streamID]
+	sq, ok := m.queues[streamID]
 	m.mu.RUnlock()
-
 	if !ok {
-		m.logger.Error("BUG: PullFrames called for a non-registered stream", "streamID", streamID)
-		return nil, fmt.Errorf("internal error: stream %d not registered in multiplexer", streamID)
+		return 0, fmt.Errorf("stream %d not registered", streamID)
 	}
 
-	q.mu.Lock()
-	defer q.mu.Unlock()
+	sq.mu.Lock()
+	defer sq.mu.Unlock()
 
-	if q.expectedSeq == 0 {
-		q.expectedSeq = 1
+	// Boucle d'attente.
+	for !sq.isClosed && len(sq.buffer) == 0 && (sq.readyFrames.Len() == 0 || (*sq.readyFrames)[0].frame.Offset != sq.nextReadOffset) {
+		sq.cond.Wait()
 	}
 
-	// Boucle d'attente : on attend jusqu'à ce que la frame attendue (q.expectedSeq) soit présente.
-	for {
-		if _, ok := q.framesBySeq[q.expectedSeq]; ok {
-			break // La frame est là, on peut continuer.
+	if sq.isClosed && len(sq.buffer) == 0 && sq.readyFrames.Len() == 0 {
+		return 0, io.EOF
+	}
+
+	totalBytesRead := 0
+
+	// 1. Vider le buffer interne.
+	if len(sq.buffer) > 0 {
+		n := copy(p, sq.buffer)
+		sq.buffer = sq.buffer[n:]
+		totalBytesRead += n
+	}
+
+	// 2. Lire depuis le tas de trames prêtes.
+	for totalBytesRead < len(p) && sq.readyFrames.Len() > 0 && (*sq.readyFrames)[0].frame.Offset == sq.nextReadOffset {
+		rf := heap.Pop(sq.readyFrames).(readyFrame)
+		frame := rf.frame
+
+		payload := frame.Payload
+		spaceLeft := len(p) - totalBytesRead
+		bytesToCopy := len(payload)
+
+		if bytesToCopy > spaceLeft {
+			bytesToCopy = spaceLeft
+			sq.buffer = append(sq.buffer, payload[bytesToCopy:]...)
 		}
-		// La frame n'est pas là. On attend un signal.
-		// Wait() déverrouille atomiquement le mutex et attend, puis le reverrouille au réveil.
-		q.cond.Wait()
+
+		copy(p[totalBytesRead:], payload[:bytesToCopy])
+		totalBytesRead += bytesToCopy
+		sq.nextReadOffset += int64(len(payload))
 	}
 
-	var out []byte
-	seq := q.expectedSeq
-
-	// On collecte toutes les frames contiguës disponibles.
-	for {
-		f, ok := q.framesBySeq[seq]
-		if !ok {
-			// Plus de frames contiguës, on s'arrête.
-			break
-		}
-
-		if len(out)+len(f.Payload) > max && len(out) > 0 {
-			// La frame suivante ne rentre pas dans le buffer de lecture et on a déjà des données.
-			break
-		}
-
-		out = append(out, f.Payload...)
-		delete(q.framesBySeq, seq)
-		seq++
-
-		if len(out) >= max {
-			break
-		}
-	}
-
-	// Mettre à jour la séquence attendue pour la prochaine lecture.
-	if seq > q.expectedSeq {
-		m.logger.Debug("advanced expected sequence",
-			"stream", streamID,
-			"from", q.expectedSeq,
-			"to", seq)
-		q.expectedSeq = seq
-	}
-
-	return out, nil
+	return totalBytesRead, nil
 }

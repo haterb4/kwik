@@ -13,12 +13,14 @@ type streamManagerImpl struct {
 	streams      map[protocol.StreamID]*StreamImpl
 	nextStreamID protocol.StreamID
 	logger       logger.Logger
+	session      Session
 }
 
-func NewStreamManager() *streamManagerImpl {
+func NewStreamManager(session Session) *streamManagerImpl {
 	return &streamManagerImpl{
 		streams:      make(map[protocol.StreamID]*StreamImpl),
 		nextStreamID: 1,
+		session:      session,
 		logger:       logger.NewLogger(logger.LogLevelDebug).WithComponent("STREAM_MANAGER"),
 	}
 }

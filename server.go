@@ -35,15 +35,16 @@ func NewServerSession(id protocol.SessionID, conn *quic.Conn) *ServerSession {
 	packer := transport.NewPacker(1200)
 	multiplexer := transport.NewMultiplexer(packer)
 	sess := &ServerSession{
-		id:          id,
-		pathMgr:     pathMgr,
-		streamMgr:   NewStreamManager(),
+		id:      id,
+		pathMgr: pathMgr,
+
 		localAddr:   conn.LocalAddr().String(),
 		remoteAddr:  conn.RemoteAddr().String(),
 		logger:      logger.NewLogger(logger.LogLevelSilent).WithComponent("SERVER_SESSION"),
 		packer:      packer,
 		multiplexer: multiplexer,
 	}
+	sess.streamMgr = NewStreamManager(sess)
 	pathid, err := pathMgr.AccpetPath(conn, sess)
 	if err != nil {
 		panic(err)

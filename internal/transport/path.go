@@ -20,10 +20,16 @@ import (
 	"github.com/s-anzie/kwik/internal/protocol"
 )
 
+type pathStream struct {
+	stream   *quic.Stream
+	WriteSeq uint64
+	readSeq  uint64
+}
+
 type path struct {
 	id      protocol.PathID
 	conn    *quic.Conn
-	streams map[protocol.StreamID]*quic.Stream
+	streams map[protocol.StreamID]*pathStream
 	mu      sync.Mutex
 	logger  logger.Logger
 	// role: true if this path was created by a client (active dial), false if accepted by server
@@ -56,7 +62,7 @@ func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool, session Session
 		id:                   id,
 		conn:                 conn,
 		isClient:             isClient,
-		streams:              make(map[protocol.StreamID]*quic.Stream),
+		streams:              make(map[protocol.StreamID]*pathStream),
 		logger:               logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH"),
 		healthIntervalMs:     15000, // Augmenter à 15 secondes pour réduire le trafic de contrôle
 		healthy:              1,
@@ -76,7 +82,7 @@ func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool, session Session
 		if err != nil {
 			panic(err)
 		}
-		path.streams[protocol.StreamID(0)] = stream
+		path.streams[protocol.StreamID(0)] = &pathStream{stream: stream, WriteSeq: 0, readSeq: 0}
 		// Mark control stream as ready since we just created it
 		close(path.controlReady)
 		go path.runStreamReader(protocol.StreamID(0), stream)
@@ -92,7 +98,7 @@ func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool, session Session
 		if err != nil {
 			panic(err)
 		}
-		path.streams[protocol.StreamID(0)] = stream
+		path.streams[protocol.StreamID(0)] = &pathStream{stream: stream, WriteSeq: 0}
 		// Mark control stream as ready since we just accepted it
 		close(path.controlReady)
 		go path.runStreamReader(protocol.StreamID(0), stream)
@@ -122,6 +128,39 @@ func (p *path) RemoveStream(streamID protocol.StreamID) {
 	defer p.mu.Unlock()
 	delete(p.streams, streamID)
 }
+func (p *path) GetStream(streamID protocol.StreamID) (*pathStream, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	stream, ok := p.streams[streamID]
+	return stream, ok
+}
+
+func (p *path) WriteSeq(streamID protocol.StreamID) (uint64, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	stream, ok := p.streams[streamID]
+	if !ok {
+		return 0, false
+	}
+	seq := atomic.AddUint64(&stream.WriteSeq, 1)
+	stream.WriteSeq = seq
+	return seq, true
+}
+
+func (p *path) AdvanceReadSeq(streamID protocol.StreamID, receivedSeq uint64) (isExpected bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ps, ok := p.streams[streamID]
+	if !ok {
+		return false
+	} // Stream n'existe pas
+
+	if receivedSeq == ps.readSeq {
+		ps.readSeq++
+		return true
+	}
+	return false
+}
 
 // IsSessionReady reports whether the handshake/session is established.
 func (p *path) IsSessionReady() bool {
@@ -145,7 +184,7 @@ func (p *path) OpenStreamSync(ctx context.Context, streamID protocol.StreamID) e
 		return protocol.NewExistStreamError(p.id, streamID)
 	}
 
-	p.streams[streamID] = stream
+	p.streams[streamID] = &pathStream{stream: stream, WriteSeq: 0, readSeq: 1}
 	p.logger.Debug("Successfully opened stream", "pathID", p.id, "streamID", streamID, "quicStreamID", stream.StreamID())
 	// start reader goroutine to forward length-prefixed packets to multiplexer
 	go p.runStreamReader(streamID, stream)
@@ -166,7 +205,7 @@ func (p *path) OpenStream(streamID protocol.StreamID) error {
 		return protocol.NewExistStreamError(p.id, streamID)
 	}
 
-	p.streams[streamID] = stream
+	p.streams[streamID] = &pathStream{stream: stream, WriteSeq: 0, readSeq: 1}
 	p.logger.Debug("Successfully opened stream", "pathID", p.id, "streamID", streamID, "quicStreamID", stream.StreamID())
 	// start reader goroutine to forward length-prefixed packets to multiplexer
 	go p.runStreamReader(streamID, stream)
@@ -191,7 +230,7 @@ func (p *path) AcceptStream(ctx context.Context, streamID protocol.StreamID) err
 		return protocol.NewExistStreamError(p.id, streamID)
 	}
 
-	p.streams[streamID] = stream
+	p.streams[streamID] = &pathStream{stream: stream, WriteSeq: 0, readSeq: 1}
 	p.lastAcceptedStreamID = streamID // Update last accepted stream ID
 
 	// Start reader goroutine to forward length-prefixed packets to multiplexer
@@ -399,7 +438,8 @@ func (p *path) startClientHandshake() error {
 	p.sessionMu.Unlock()
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		h := &protocol.Frame{Type: protocol.FrameTypeHandshake, StreamID: 0, Seq: 0, Payload: nonce}
+		seq, _ := p.WriteSeq(0)
+		h := &protocol.Frame{Type: protocol.FrameTypeHandshake, StreamID: 0, Seq: seq, Payload: nonce}
 		p.logger.Debug("start handshake attempt", "path", p.id, "isClient", p.isClient, "attempt", attempt)
 		if err := p.SendControlFrame(h); err != nil {
 			p.logger.Warn("handshake send failed", "path", p.id, "err", err, "attempt", attempt)
@@ -468,10 +508,11 @@ func (p *path) startHealthLoop() {
 		ts := time.Now().UnixMilli()
 		var tb [8]byte
 		binary.BigEndian.PutUint64(tb[:], uint64(ts))
+		seq, _ := p.WriteSeq(0)
 		ping := &protocol.Frame{
 			Type:     protocol.FrameTypePing,
 			StreamID: 0,
-			Seq:      0,
+			Seq:      seq,
 			Payload:  tb[:],
 		}
 
@@ -656,7 +697,8 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 	case protocol.FrameTypePing:
 		// reply with Pong
 		// echo payload back
-		pong := &protocol.Frame{Type: protocol.FrameTypePong, StreamID: 0, Seq: 0, Payload: f.Payload}
+		seq, _ := p.WriteSeq(0)
+		pong := &protocol.Frame{Type: protocol.FrameTypePong, StreamID: 0, Seq: seq, Payload: f.Payload}
 		return p.SendControlFrame(pong)
 	case protocol.FrameTypePong:
 		// record reception time and update metrics
@@ -671,7 +713,8 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 		p.logger.Debug("received handshake frame", "path", p.id, "isClient", p.isClient)
 		// reply with handshake response
 		// echo the nonce back as a response
-		resp := &protocol.Frame{Type: protocol.FrameTypeHandshakeResp, StreamID: 0, Seq: 0, Payload: f.Payload}
+		seq, _ := p.WriteSeq(0)
+		resp := &protocol.Frame{Type: protocol.FrameTypeHandshakeResp, StreamID: 0, Seq: seq, Payload: f.Payload}
 		if err := p.SendControlFrame(resp); err != nil {
 			p.logger.Error("failed to send handshake response", "path", p.id, "err", err)
 			return err
@@ -723,10 +766,11 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 
 		// Préparer la réponse
 		respPayload := protocol.EncodeAddPathRespPayload(payload.Address, pathID)
+		seq, _ := p.WriteSeq(0)
 		respFrame := &protocol.Frame{
 			Type:     protocol.FrameTypeAddPathResp,
 			StreamID: 0,
-			Seq:      0,
+			Seq:      seq,
 			Payload:  respPayload,
 		}
 
@@ -769,7 +813,10 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 			"relayPathID", payload.RelayPathID,
 			"destStreamID", payload.DestStreamID,
 			"dataLen", len(payload.Data))
-
+		if payload.DestStreamID == 0 {
+			p.logger.Error("invalid DestStreamID 0 in RelayData")
+			return fmt.Errorf("invalid DestStreamID 0 in RelayData")
+		}
 		// Récupérer le path manager pour obtenir le path correspondant au relayPathID
 		pathMgr := p.session.PathManager()
 		relayPath := pathMgr.GetPath(payload.RelayPathID)
@@ -804,22 +851,24 @@ func (p *path) HandleControlFrame(f *protocol.Frame) error {
 					"error", err)
 				return err
 			}
+		} else {
+			p.logger.Debug("stream already exists on relay path", "relayPathID", payload.RelayPathID, "streamID", payload.DestStreamID)
 		}
 
 		// Écrire les données sur le stream du path cible
-		n, err := relayPath.WriteStream(payload.DestStreamID, payload.Data)
+		err = p.session.Packer().SubmitFrame(relayPath, f)
 		if err != nil {
-			p.logger.Error("failed to write data to relay stream",
+			p.logger.Error("failed to submit data to packer for stream",
 				"relayPathID", payload.RelayPathID,
 				"streamID", payload.DestStreamID,
 				"error", err)
 			return err
 		}
 
-		p.logger.Debug("wrote data to relay stream",
+		p.logger.Debug("Submitted data to packer for stream",
 			"relayPathID", payload.RelayPathID,
 			"streamID", payload.DestStreamID,
-			"bytesWritten", n)
+			"dataLen", len(payload.Data))
 
 		return nil
 	default:
@@ -863,7 +912,7 @@ func (p *path) ReadStream(streamID protocol.StreamID, b []byte) (int, error) {
 			panic(errMsg)
 		}
 	}
-	return s.Read(b)
+	return s.stream.Read(b)
 }
 
 // WriteStream writes to the stored quic.Stream for the provided streamID.
@@ -896,7 +945,7 @@ func (p *path) WriteStream(streamID protocol.StreamID, b []byte) (int, error) {
 	start := time.Now()
 
 	// Écriture principale
-	n, err := s.Write(b)
+	n, err := s.stream.Write(b)
 	dur := time.Since(start)
 
 	// En cas d'erreur lors de l'écriture, journaliser et renvoyer l'erreur
@@ -911,7 +960,7 @@ func (p *path) WriteStream(streamID protocol.StreamID, b []byte) (int, error) {
 			// Une écriture vide peut parfois forcer le flush du buffer sous-jacent
 			// C'est une technique qui peut aider à garantir que les données précédentes sont envoyées
 			emptySync := make([]byte, 0) // Message vide pour forcer le flush
-			_, syncErr := s.Write(emptySync)
+			_, syncErr := s.stream.Write(emptySync)
 			if syncErr != nil {
 				// Une erreur ici n'est pas critique, nous l'enregistrons simplement
 				p.logger.Debug("WriteStream: sync write failed", "path", p.id, "stream", streamID, "err", syncErr)
@@ -941,7 +990,7 @@ func (p *path) CloseStream(streamID protocol.StreamID) error {
 	p.mu.Unlock()
 
 	// Fermer le stream QUIC sous-jacent
-	return stream.Close()
+	return stream.stream.Close()
 }
 
 func (p *path) Close() error {
@@ -969,7 +1018,7 @@ func (p *path) Close() error {
 	// Stocker une copie locale des streams pour les fermer après avoir libéré le mutex
 	streamsCopy := make(map[protocol.StreamID]*quic.Stream)
 	for sid, s := range p.streams {
-		streamsCopy[sid] = s
+		streamsCopy[sid] = s.stream
 		delete(p.streams, sid) // Supprimer immédiatement de la map pour éviter les accès concurrents
 	}
 	p.mu.Unlock()

@@ -57,10 +57,11 @@ func (r *relayImpl) SendRawData(data []byte, streamID protocol.StreamID) (int, e
 	payload := protocol.EncodeRelayDataPayload(r.pathID, streamID, data)
 
 	// Créer la trame avec le type RelayData
+	seq, _ := r.path.WriteSeq(0)
 	frame := &protocol.Frame{
 		Type:     protocol.FrameTypeRelayData,
-		StreamID: 0, // On utilise le stream de contrôle (0)
-		Seq:      0, // La séquence sera gérée par le packer
+		StreamID: streamID, // On utilise le stream de contrôle (0)
+		Seq:      seq,      // La séquence sera gérée par le packer
 		Payload:  payload,
 	}
 

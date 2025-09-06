@@ -30,6 +30,7 @@ const (
 type Frame struct {
 	Type     FrameType
 	StreamID StreamID
+	Offset   int64
 	Seq      uint64 // sequence number for ordering within a stream
 	Payload  []byte
 }
@@ -49,6 +50,9 @@ func EncodeFrame(w io.Writer, f *Frame) error {
 		return err
 	}
 	if err := binary.Write(w, binary.BigEndian, uint64(f.StreamID)); err != nil {
+		return err
+	}
+	if err := binary.Write(w, binary.BigEndian, f.Offset); err != nil {
 		return err
 	}
 	if err := binary.Write(w, binary.BigEndian, f.Seq); err != nil {
@@ -73,6 +77,10 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 	if err := binary.Read(r, binary.BigEndian, &sid); err != nil {
 		return nil, err
 	}
+	var off int64
+	if err := binary.Read(r, binary.BigEndian, &off); err != nil {
+		return nil, err
+	}
 	var seq uint64
 	if err := binary.Read(r, binary.BigEndian, &seq); err != nil {
 		return nil, err
@@ -88,6 +96,7 @@ func DecodeFrame(r io.Reader) (*Frame, error) {
 	return &Frame{
 		Type:     FrameType(ft),
 		StreamID: StreamID(sid),
+		Offset:   off,
 		Seq:      seq,
 		Payload:  payload,
 	}, nil

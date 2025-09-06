@@ -54,6 +54,7 @@ func main() {
 	// Lire les métadonnées
 	buf := make([]byte, 4096)
 	n, err := stream.Read(buf)
+	stream.SetReadOffset(0)
 	if err != nil {
 		log.Fatalf("Failed to read metadata: %v", err)
 	}

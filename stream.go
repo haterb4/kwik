@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 
 	"github.com/s-anzie/kwik/internal/logger"
 	"github.com/s-anzie/kwik/internal/protocol"
@@ -13,14 +12,15 @@ import (
 
 type StreamImpl struct {
 	id             protocol.StreamID
-	offset         int
 	remoteStreamID protocol.StreamID
 	paths          map[protocol.PathID]transport.Path
 	mu             sync.RWMutex
 	primaryPathID  protocol.PathID
-	seqCounter     uint64
+	writeOffset    int64
+	readOffset     int64
 	logger         logger.Logger
 	streamManager  *streamManagerImpl
+	// aggregator     *StreamAggregator
 }
 
 // Ensure StreamImpl implements .Stream
@@ -32,11 +32,18 @@ func NewStream(id protocol.StreamID, sm *streamManagerImpl) *StreamImpl {
 		logger:        logger.NewLogger(logger.LogLevelDebug).WithComponent("STREAM_IMPL"),
 		paths:         make(map[protocol.PathID]transport.Path),
 		streamManager: sm,
+		writeOffset:   0,
+		readOffset:    0,
+		// aggregator:    NewStreamAggregator(id)
 	}
 }
 
 // Read implements the io.Reader interface to read data from the stream.
 // It blocks until data is available or an error occurs.
+// func (s *StreamImpl) NewRead(p []byte) (int, error) {
+// 	return s.aggregator.Read(p)
+// }
+
 func (s *StreamImpl) Read(p []byte) (int, error) {
 	s.logger.Info("Read attempt", "streamID", s.id, "bufferSize", len(p))
 
@@ -64,19 +71,17 @@ func (s *StreamImpl) Read(p []byte) (int, error) {
 	}
 
 	// Appel direct à PullFrames qui est maintenant bloquant.
-	data, err := mx.PullFrames(s.id, len(p))
+	n, err := mx.PullFrames(s.id, p)
 	if err != nil {
 		s.logger.Error("Read failed on PullFrames", "streamID", s.id, "error", err)
 		return 0, err
 	}
 
-	if len(data) == 0 {
+	if n == 0 {
 		// PullFrames peut retourner 0 octets si le stream est fermé.
 		// Pour se conformer à io.Reader, on retourne io.EOF dans ce cas.
 		return 0, io.EOF
 	}
-
-	n := copy(p, data)
 	s.logger.Info("Read succeeded", "streamID", s.id, "read", n)
 	return n, nil
 }
@@ -93,40 +98,34 @@ func (s *StreamImpl) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	currentOffset := s.writeOffset
+	s.writeOffset += int64(len(p))
+	primaryPath, ok := s.paths[s.primaryPathID]
+	s.mu.Unlock()
 
-	// Try the primary path first if available
-	if s.primaryPathID <= 0 {
+	if !ok {
+		s.logger.Error("No primary path set for writing", "streamID", s.id)
 		return 0, protocol.NewPathNotExistsError(s.primaryPathID)
 	}
 
-	if path, ok := s.paths[s.primaryPathID]; ok {
-		n, err := s.writeToPath(path, p)
-
-		if err != nil {
-			s.logger.Error("Write failed",
-				"streamID", s.id,
-				"error", err,
-				"pathID", s.primaryPathID)
-		} else {
-			s.logger.Info("Write succeeded",
-				"streamID", s.id,
-				"written", n)
-		}
-
-		return n, err
-	}
-	return 0, protocol.NewPathNotExistsError(s.primaryPathID)
+	// Note: writeToPath doit être adapté pour accepter l'offset
+	return s.writeToPath(primaryPath, p, currentOffset)
 }
 
 // writeToPath is a helper method that writes data to a specific path
-func (s *StreamImpl) writeToPath(path transport.Path, p []byte) (int, error) {
+func (s *StreamImpl) writeToPath(path transport.Path, p []byte, offset int64) (int, error) {
 	if path == nil {
 		s.logger.Error("Cannot write to nil path")
 		return 0, fmt.Errorf("cannot write to nil path")
 	}
-
+	seq, ok := path.WriteSeq(s.id)
+	if !ok {
+		s.logger.Error("No write sequence number for stream on path",
+			"streamID", s.id,
+			"pathID", path.PathID())
+		return 0, fmt.Errorf("no write sequence number for stream %d on path %d", s.id, path.PathID())
+	}
 	pid := path.PathID()
 	s.logger.Debug("1- Writing to path",
 		"streamID", s.id,
@@ -134,18 +133,20 @@ func (s *StreamImpl) writeToPath(path transport.Path, p []byte) (int, error) {
 		"size", len(p))
 
 	// Package the payload into a frame and submit to packer
-	seq := atomic.AddUint64(&s.seqCounter, 1)
+
 	f := &protocol.Frame{
 		Type:     protocol.FrameTypeData,
 		StreamID: s.id,
-		Seq:      seq,
+		Offset:   offset, // Assigner l'offset global
+		Seq:      seq,    // Seq is not used for data frames in this context
 		Payload:  append([]byte(nil), p...),
 	}
 
-	s.logger.Debug("Using sequence number for frame",
+	s.logger.Debug("Using stream offset for frame",
 		"streamID", s.id,
+		"offset", offset,
 		"seq", seq,
-		"nextSeq", atomic.LoadUint64(&s.seqCounter)+1)
+		"nextOffset", s.writeOffset)
 
 	// Get the packer from the path's session
 	session := path.Session()
@@ -214,7 +215,7 @@ func (s *StreamImpl) writeToPath(path transport.Path, p []byte) (int, error) {
 func (s *StreamImpl) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
+	// s.aggregator.Close()
 	var lastErr error
 	for _, path := range s.paths {
 		if err := path.CloseStream(s.id); err != nil {
@@ -236,15 +237,30 @@ func (s *StreamImpl) StreamID() protocol.StreamID {
 }
 
 // Secondary stream isolation methods
-func (s *StreamImpl) SetOffset(offset int) error {
-	s.offset = offset
+func (s *StreamImpl) SetWriteOffset(offset int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writeOffset = offset
 	return nil
 }
 
-func (s *StreamImpl) GetOffset() int {
-	return s.offset
+func (s *StreamImpl) GetWriteOffset() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.writeOffset
 }
-
+func (s *StreamImpl) SetReadOffset(offset int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.streamManager.session.Multiplexer().SetStreamNextStreamOffset(s.id, offset)
+	s.readOffset = offset
+	return nil
+}
+func (s *StreamImpl) GetReadOffset() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.readOffset
+}
 func (s *StreamImpl) SetRemoteStreamID(remoteStreamID protocol.StreamID) error {
 	s.remoteStreamID = remoteStreamID
 	return nil
@@ -353,16 +369,4 @@ func (s *StreamImpl) GetPath(pid protocol.PathID) (transport.Path, bool) {
 	defer s.mu.RUnlock()
 	p, ok := s.paths[pid]
 	return p, ok
-}
-
-// SetSeqNumber sets the sequence number to use for the next write operation.
-// After each write, the sequence number will be automatically incremented.
-// This method is thread-safe.
-func (s *StreamImpl) SetSeqNumber(seq uint64) error {
-	atomic.StoreUint64(&s.seqCounter, seq-1) // -1 because the counter will be incremented before use in writeToPath
-	s.logger.Debug("Set sequence number for stream",
-		"streamID", s.id,
-		"newSeq", seq,
-		"nextSeqAfterWrite", seq)
-	return nil
 }

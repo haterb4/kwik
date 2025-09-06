@@ -18,13 +18,12 @@ type Stream interface {
 	StreamID() protocol.StreamID
 
 	// Secondary stream isolation methods
-	SetOffset(offset int) error
-	GetOffset() int
+	SetWriteOffset(offset int64) error
+	GetWriteOffset() int64
+	SetReadOffset(offset int64) error
+	GetReadOffset() int64
 	SetRemoteStreamID(remoteStreamID protocol.StreamID) error
 	RemoteStreamID() protocol.StreamID
-
-	// Sequence control
-	SetSeqNumber(seq uint64) error
 }
 
 type StreamManager interface {
@@ -92,6 +91,7 @@ type Path interface {
 	Session() Session
 	// GetLastAcceptedStreamID returns the ID of the last accepted stream
 	GetLastAcceptedStreamID() protocol.StreamID
+	WriteSeq(streamID protocol.StreamID) (uint64, bool)
 }
 type Relay interface {
 	Address() string
