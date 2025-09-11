@@ -202,7 +202,7 @@ func (s *PingPongServer) readMessage(stream kwik.Stream) (*Message, error) {
 
 func (s *PingPongServer) writeMessage(stream kwik.Stream, msg Message) error {
 	// TRACK: log chaque demande d'envoi côté serveur (sans streamID)
-	fmt.Printf("TRACK AppServerWrite: type=%s, counter=%d, ts=%d\n", msg.Type, msg.Counter, msg.Timestamp.UnixNano())
+	// fmt.Printf("TRACK AppServerWrite: type=%s, counter=%d, ts=%d\n", msg.Type, msg.Counter, msg.Timestamp.UnixNano())
 	// Préparer le message
 	msgBytes := make([]byte, 20) // 4 + 8 + 8 bytes
 

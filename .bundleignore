@@ -1,0 +1,8 @@
+bin/
+examples/
+benchmark/
+**/bin/
+
+*.log
+**/*.log
+**/log.txt

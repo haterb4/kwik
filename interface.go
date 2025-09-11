@@ -7,7 +7,7 @@ import (
 )
 
 type Relay = transport.Relay
-type streamManager = transport.StreamManager
+type StreamManager = transport.StreamManager
 type Session = transport.Session
 type Stream = transport.Stream
 

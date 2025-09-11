@@ -3,267 +3,473 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 )
 
+// encode VarInt simplifié (toujours 8 octets big-endian pour l’instant)
+func writeVarInt(w io.Writer, v uint64) error {
+	// Simple 8-byte big-endian encoding for reliability
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], v)
+	_, err := w.Write(buf[:])
+	return err
+}
+
+func readVarInt(r io.Reader) (uint64, error) {
+	// Simple 8-byte big-endian decoding for reliability
+	var buf [8]byte
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return 0, err
+	}
+	return binary.BigEndian.Uint64(buf[:]), nil
+}
+
 // FrameType indicates the purpose of a frame inside a packet.
+type Frame interface {
+	Type() FrameType
+	// String provides a human-readable representation of the frame for logging/debugging.
+	String() string
+	Serialize() ([]byte, error)
+}
+
 type FrameType uint8
 
 const (
-	FrameTypeData FrameType = 0x1
-	FrameTypeAck  FrameType = 0x2
-	FrameTypeNack FrameType = 0x3
+	FrameTypeStream FrameType = 0x1
+	FrameTypeAck    FrameType = 0x2
+	FrameTypeNack   FrameType = 0x3
 	// Control frames
-	FrameTypeHandshake     FrameType = 0x4
-	FrameTypeHandshakeResp FrameType = 0x5
-	FrameTypePing          FrameType = 0x6
-	FrameTypePong          FrameType = 0x7
+	FrameTypeHandshake FrameType = 0x4
+	FrameTypePing      FrameType = 0x5
 	// Path management frames
-	FrameTypeAddPath     FrameType = 0x8
-	FrameTypeAddPathResp FrameType = 0x9
+	FrameTypeAddPath     FrameType = 0x6
+	FrameTypeAddPathResp FrameType = 0x7
 	// Relay data frame
-	FrameTypeRelayData FrameType = 0xA
+	FrameTypeRelayData FrameType = 0x8
+	// Logical stream open frame
+	FrameTypeOpenStream FrameType = 0x9
+	// Logical stream open response frame
+	FrameTypeOpenStreamResp FrameType = 0xA
 	// future frame types can be added here
 )
 
-// Frame is the unit of logical data delivered to a destination StreamID.
-type Frame struct {
-	Type     FrameType
-	StreamID StreamID
-	Offset   int64
-	Seq      uint64 // sequence number for ordering within a stream
-	Payload  []byte
+// OpenStreamRespFrame accuse réception de l'ouverture d'un flux logique (StreamID)
+type OpenStreamRespFrame struct {
+	StreamID uint64
+	Success  bool
 }
 
-// Packet carries zero or more full Frames. Packets are atomic on the wire:
-// we prefix each packet with a 4-byte length (big-endian) and then the packet body.
-// Inside the packet we serialize frames one after another.
-
-// encodeFrame writes a frame into w in the following format:
-// 1 byte  - frame type
-// 8 bytes - streamID (uint64)
-// 8 bytes - seq (uint64)
-// 4 bytes - payload length (uint32)
-// N bytes - payload
-func EncodeFrame(w io.Writer, f *Frame) error {
-	if err := binary.Write(w, binary.BigEndian, uint8(f.Type)); err != nil {
-		return err
+func (f *OpenStreamRespFrame) Type() FrameType { return FrameTypeOpenStreamResp }
+func (f *OpenStreamRespFrame) String() string {
+	return fmt.Sprintf("OpenStreamRespFrame{StreamID: %d, Success: %t}", f.StreamID, f.Success)
+}
+func (f *OpenStreamRespFrame) Serialize() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := buf.WriteByte(byte(f.Type())); err != nil {
+		return nil, err
 	}
-	if err := binary.Write(w, binary.BigEndian, uint64(f.StreamID)); err != nil {
-		return err
+	if err := writeVarInt(buf, f.StreamID); err != nil {
+		return nil, err
 	}
-	if err := binary.Write(w, binary.BigEndian, f.Offset); err != nil {
-		return err
+	var okByte byte
+	if f.Success {
+		okByte = 1
+	} else {
+		okByte = 0
 	}
-	if err := binary.Write(w, binary.BigEndian, f.Seq); err != nil {
-		return err
+	if err := buf.WriteByte(okByte); err != nil {
+		return nil, err
 	}
-	if err := binary.Write(w, binary.BigEndian, uint32(len(f.Payload))); err != nil {
-		return err
-	}
-	if _, err := w.Write(f.Payload); err != nil {
-		return err
-	}
-	return nil
+	return buf.Bytes(), nil
 }
 
-// DecodeFrame reads one frame from r. Caller must ensure stream contains a full frame.
-func DecodeFrame(r io.Reader) (*Frame, error) {
-	var ft uint8
-	if err := binary.Read(r, binary.BigEndian, &ft); err != nil {
+func parseOpenStreamRespFrame(r *bytes.Reader) (*OpenStreamRespFrame, error) {
+	streamID, err := readVarInt(r)
+	if err != nil {
 		return nil, err
 	}
-	var sid uint64
-	if err := binary.Read(r, binary.BigEndian, &sid); err != nil {
+	okByte, err := r.ReadByte()
+	if err != nil {
 		return nil, err
 	}
-	var off int64
-	if err := binary.Read(r, binary.BigEndian, &off); err != nil {
+	return &OpenStreamRespFrame{StreamID: streamID, Success: okByte == 1}, nil
+}
+
+// OpenStreamFrame signale l'ouverture d'un flux logique (StreamID)
+type OpenStreamFrame struct {
+	StreamID uint64
+}
+
+func (f *OpenStreamFrame) Type() FrameType { return FrameTypeOpenStream }
+func (f *OpenStreamFrame) String() string {
+	return fmt.Sprintf("OpenStreamFrame{StreamID: %d}", f.StreamID)
+}
+func (f *OpenStreamFrame) Serialize() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := buf.WriteByte(byte(f.Type())); err != nil {
 		return nil, err
 	}
-	var seq uint64
-	if err := binary.Read(r, binary.BigEndian, &seq); err != nil {
+	if err := writeVarInt(buf, f.StreamID); err != nil {
 		return nil, err
 	}
-	var l uint32
-	if err := binary.Read(r, binary.BigEndian, &l); err != nil {
+	return buf.Bytes(), nil
+}
+
+func parseOpenStreamFrame(r *bytes.Reader) (*OpenStreamFrame, error) {
+	streamID, err := readVarInt(r)
+	if err != nil {
 		return nil, err
 	}
-	payload := make([]byte, l)
+	return &OpenStreamFrame{StreamID: streamID}, nil
+}
+
+// StreamFrame represents a QUIC STREAM frame in the new formalism.
+type StreamFrame struct {
+	StreamID uint64
+	Offset   uint64
+	Fin      bool
+	Data     []byte
+}
+
+func (f *StreamFrame) Type() FrameType { return FrameTypeStream }
+func (f *StreamFrame) String() string {
+	return fmt.Sprintf("StreamFrame{StreamID: %d, Offset: %d, Fin: %t, DataLen: %d}", f.StreamID, f.Offset, f.Fin, len(f.Data))
+}
+func (f *StreamFrame) Serialize() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Frame type
+	if err := buf.WriteByte(byte(f.Type())); err != nil {
+		return nil, err
+	}
+
+	if err := writeVarInt(buf, f.StreamID); err != nil {
+		return nil, err
+	}
+	if err := writeVarInt(buf, f.Offset); err != nil {
+		return nil, err
+	}
+
+	// Fin flag
+	if f.Fin {
+		buf.WriteByte(1)
+	} else {
+		buf.WriteByte(0)
+	}
+
+	// Data
+	if err := writeVarInt(buf, uint64(len(f.Data))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(f.Data); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func parseStreamFrame(r *bytes.Reader) (*StreamFrame, error) {
+	streamID, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+	offset, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+	finByte, err := r.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	fin := finByte == 1
+
+	dataLen, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+	payload := make([]byte, dataLen)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
 	}
-	return &Frame{
-		Type:     FrameType(ft),
-		StreamID: StreamID(sid),
-		Offset:   off,
-		Seq:      seq,
-		Payload:  payload,
+
+	return &StreamFrame{
+		StreamID: streamID,
+		Offset:   offset,
+		Fin:      fin,
+		Data:     payload,
 	}, nil
 }
 
-// AckRange represents an inclusive range starting at Start for Count packets.
-type AckRange struct {
-	Start uint64
-	Count uint32
+// Control frame types in the new model
+type HandshakeFrame struct{}
+
+func (f *HandshakeFrame) Type() FrameType { return FrameTypeHandshake }
+func (f *HandshakeFrame) String() string {
+	return "HandshakeFrame{}"
+}
+func (f *HandshakeFrame) Serialize() ([]byte, error) {
+	return []byte{byte(f.Type())}, nil
 }
 
-// EncodeAckPayload encodes ack ranges into payload bytes: 4-byte count, then each range: 8-byte start, 4-byte count
-func EncodeAckPayload(ranges []AckRange) []byte {
-	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, uint32(len(ranges)))
-	for _, r := range ranges {
-		binary.Write(&buf, binary.BigEndian, r.Start)
-		binary.Write(&buf, binary.BigEndian, r.Count)
-	}
-	return buf.Bytes()
+type PingFrame struct{}
+
+func (f *PingFrame) Type() FrameType { return FrameTypePing }
+func (f *PingFrame) String() string {
+	return "PingFrame{}"
+}
+func (f *PingFrame) Serialize() ([]byte, error) {
+	return []byte{byte(f.Type())}, nil
 }
 
-// DecodeAckPayload decodes ack ranges from payload bytes.
-func DecodeAckPayload(b []byte) ([]AckRange, error) {
-	buf := bytes.NewReader(b)
-	var cnt uint32
-	if err := binary.Read(buf, binary.BigEndian, &cnt); err != nil {
-		return nil, err
-	}
-	out := make([]AckRange, 0, cnt)
-	for i := uint32(0); i < cnt; i++ {
-		var start uint64
-		var count uint32
-		if err := binary.Read(buf, binary.BigEndian, &start); err != nil {
-			return nil, err
-		}
-		if err := binary.Read(buf, binary.BigEndian, &count); err != nil {
-			return nil, err
-		}
-		out = append(out, AckRange{Start: start, Count: count})
-	}
-	return out, nil
-}
-
-// AddPathPayload represents the payload of an AddPath frame
-type AddPathPayload struct {
+type AddPathFrame struct {
 	Address string
 }
 
-// EncodeAddPathPayload encodes an address into a byte slice for an AddPath frame
-// Format: string length (uint16) followed by address string
-func EncodeAddPathPayload(address string) []byte {
-	var buf bytes.Buffer
-	addrBytes := []byte(address)
-	binary.Write(&buf, binary.BigEndian, uint16(len(addrBytes)))
-	buf.Write(addrBytes)
-	return buf.Bytes()
+func (f *AddPathFrame) Type() FrameType { return FrameTypeAddPath }
+func (f *AddPathFrame) String() string {
+	return fmt.Sprintf("AddPathFrame{Address: %s}", f.Address)
+}
+func (f *AddPathFrame) Serialize() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := buf.WriteByte(byte(f.Type())); err != nil {
+		return nil, err
+	}
+	if err := writeVarInt(buf, uint64(len(f.Address))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(f.Address); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
-// DecodeAddPathPayload decodes a byte slice into an AddPathPayload
-func DecodeAddPathPayload(b []byte) (*AddPathPayload, error) {
-	buf := bytes.NewReader(b)
-	var addrLen uint16
-	if err := binary.Read(buf, binary.BigEndian, &addrLen); err != nil {
+func parseAddPathFrame(r *bytes.Reader) (*AddPathFrame, error) {
+	addrLen, err := readVarInt(r)
+	if err != nil {
 		return nil, err
 	}
-
 	addrBytes := make([]byte, addrLen)
-	if _, err := io.ReadFull(buf, addrBytes); err != nil {
+	if _, err := io.ReadFull(r, addrBytes); err != nil {
 		return nil, err
 	}
-
-	return &AddPathPayload{
+	return &AddPathFrame{
 		Address: string(addrBytes),
 	}, nil
 }
 
-// AddPathRespPayload represents the payload of an AddPathResp frame
-type AddPathRespPayload struct {
+type AddPathRespFrame struct {
 	Address string
 	PathID  PathID
 }
 
-// EncodeAddPathRespPayload encodes an address and path ID into a byte slice for an AddPathResp frame
-// Format: path ID (uint64), string length (uint16), address string
-func EncodeAddPathRespPayload(address string, pathID PathID) []byte {
-	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, uint64(pathID))
-
-	addrBytes := []byte(address)
-	binary.Write(&buf, binary.BigEndian, uint16(len(addrBytes)))
-	buf.Write(addrBytes)
-
-	return buf.Bytes()
+func (f *AddPathRespFrame) Type() FrameType { return FrameTypeAddPathResp }
+func (f *AddPathRespFrame) String() string {
+	return fmt.Sprintf("AddPathRespFrame{PathID: %d, Address: %s}", f.PathID, f.Address)
 }
-
-// DecodeAddPathRespPayload decodes a byte slice into an AddPathRespPayload
-func DecodeAddPathRespPayload(b []byte) (*AddPathRespPayload, error) {
-	buf := bytes.NewReader(b)
-
-	var pathID uint64
-	if err := binary.Read(buf, binary.BigEndian, &pathID); err != nil {
+func (f *AddPathRespFrame) Serialize() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := buf.WriteByte(byte(f.Type())); err != nil {
 		return nil, err
 	}
-
-	var addrLen uint16
-	if err := binary.Read(buf, binary.BigEndian, &addrLen); err != nil {
+	if err := writeVarInt(buf, uint64(f.PathID)); err != nil {
 		return nil, err
 	}
-
+	if err := writeVarInt(buf, uint64(len(f.Address))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.WriteString(f.Address); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+func parseAddPathRespFrame(r *bytes.Reader) (*AddPathRespFrame, error) {
+	pathID, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+	addrLen, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
 	addrBytes := make([]byte, addrLen)
-	if _, err := io.ReadFull(buf, addrBytes); err != nil {
+	if _, err := io.ReadFull(r, addrBytes); err != nil {
 		return nil, err
 	}
-
-	return &AddPathRespPayload{
-		Address: string(addrBytes),
+	return &AddPathRespFrame{
 		PathID:  PathID(pathID),
+		Address: string(addrBytes),
 	}, nil
 }
 
-// RelayDataPayload represents the payload of a RelayData frame
-type RelayDataPayload struct {
+// RelayDataFrame represents a relay data frame in the new formalism.
+type RelayDataFrame struct {
 	RelayPathID  PathID
 	DestStreamID StreamID
-	Data         []byte
+	RawData      []byte
 }
 
-// EncodeRelayDataPayload encodes a RelayDataPayload into a byte slice
-// Format: relay path ID (uint64), destination stream ID (uint64), data length (uint32), data bytes
-func EncodeRelayDataPayload(relayPathID PathID, destStreamID StreamID, data []byte) []byte {
-	var buf bytes.Buffer
-	binary.Write(&buf, binary.BigEndian, uint64(relayPathID))
-	binary.Write(&buf, binary.BigEndian, uint64(destStreamID))
-	binary.Write(&buf, binary.BigEndian, uint32(len(data)))
-	buf.Write(data)
-
-	return buf.Bytes()
+func (f *RelayDataFrame) Type() FrameType { return FrameTypeRelayData }
+func (f *RelayDataFrame) String() string {
+	return fmt.Sprintf("RelayDataFrame{RelayPathID: %d, DestStreamID: %d, RawDataLen: %d}", f.RelayPathID, f.DestStreamID, len(f.RawData))
 }
-
-// DecodeRelayDataPayload decodes a byte slice into a RelayDataPayload
-func DecodeRelayDataPayload(b []byte) (*RelayDataPayload, error) {
-	buf := bytes.NewReader(b)
-
-	var pathID uint64
-	if err := binary.Read(buf, binary.BigEndian, &pathID); err != nil {
+func (f *RelayDataFrame) Serialize() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := buf.WriteByte(byte(f.Type())); err != nil {
 		return nil, err
 	}
-
-	var streamID uint64
-	if err := binary.Read(buf, binary.BigEndian, &streamID); err != nil {
+	if err := writeVarInt(buf, uint64(f.RelayPathID)); err != nil {
 		return nil, err
 	}
-
-	var dataLen uint32
-	if err := binary.Read(buf, binary.BigEndian, &dataLen); err != nil {
+	if err := writeVarInt(buf, uint64(f.DestStreamID)); err != nil {
 		return nil, err
 	}
-
+	if err := writeVarInt(buf, uint64(len(f.RawData))); err != nil {
+		return nil, err
+	}
+	if _, err := buf.Write(f.RawData); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+func parseRelayDataFrame(r *bytes.Reader) (*RelayDataFrame, error) {
+	pathID, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+	streamID, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+	dataLen, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
 	data := make([]byte, dataLen)
-	if _, err := io.ReadFull(buf, data); err != nil {
+	if _, err := io.ReadFull(r, data); err != nil {
 		return nil, err
 	}
-
-	return &RelayDataPayload{
+	return &RelayDataFrame{
 		RelayPathID:  PathID(pathID),
 		DestStreamID: StreamID(streamID),
-		Data:         data,
+		RawData:      data,
 	}, nil
+}
+
+// NewAckRange for new ACK model (to avoid clash with legacy AckRange)
+type AckRange struct {
+	Smallest uint64
+	Largest  uint64
+}
+
+// AckFrame represents a QUIC-like ACK frame in the new formalism.
+type AckFrame struct {
+	LargestAcked uint64
+	AckDelay     uint64
+	AckRanges    []AckRange
+}
+
+func (f *AckFrame) Type() FrameType { return FrameTypeAck }
+func (f *AckFrame) String() string {
+	return fmt.Sprintf("AckFrame{LargestAcked: %d, AckDelay: %d, AckRanges: %v}", f.LargestAcked, f.AckDelay, f.AckRanges)
+}
+func (f *AckFrame) Serialize() ([]byte, error) {
+	buf := new(bytes.Buffer)
+
+	// Frame type
+	if err := buf.WriteByte(byte(f.Type())); err != nil {
+		return nil, err
+	}
+
+	if err := writeVarInt(buf, f.LargestAcked); err != nil {
+		return nil, err
+	}
+	if err := writeVarInt(buf, f.AckDelay); err != nil {
+		return nil, err
+	}
+
+	// Ranges
+	if err := writeVarInt(buf, uint64(len(f.AckRanges))); err != nil {
+		return nil, err
+	}
+	for _, r := range f.AckRanges {
+		if err := writeVarInt(buf, r.Smallest); err != nil {
+			return nil, err
+		}
+		if err := writeVarInt(buf, r.Largest); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
+func parseAckFrame(r *bytes.Reader) (*AckFrame, error) {
+	largest, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+	delay, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+
+	count, err := readVarInt(r)
+	if err != nil {
+		return nil, err
+	}
+
+	ranges := make([]AckRange, 0, count)
+	for i := uint64(0); i < count; i++ {
+		small, err := readVarInt(r)
+		if err != nil {
+			return nil, err
+		}
+		large, err := readVarInt(r)
+		if err != nil {
+			return nil, err
+		}
+		ranges = append(ranges, AckRange{Smallest: small, Largest: large})
+	}
+
+	return &AckFrame{
+		LargestAcked: largest,
+		AckDelay:     delay,
+		AckRanges:    ranges,
+	}, nil
+}
+
+func ParseFrame(data []byte) (Frame, error) {
+	r := bytes.NewReader(data)
+
+	// Lire le type
+	t, err := r.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	switch FrameType(t) {
+	case FrameTypeStream:
+		return parseStreamFrame(r)
+	case FrameTypeAck:
+		return parseAckFrame(r)
+	case FrameTypePing:
+		// un Ping n'a pas de contenu
+		return &PingFrame{}, nil
+	case FrameTypeHandshake:
+		// un Handshake n'a pas de contenu
+		return &HandshakeFrame{}, nil
+	case FrameTypeAddPath:
+		return parseAddPathFrame(r)
+	case FrameTypeAddPathResp:
+		return parseAddPathRespFrame(r)
+	case FrameTypeRelayData:
+		return parseRelayDataFrame(r)
+	case FrameTypeOpenStream:
+		return parseOpenStreamFrame(r)
+	case FrameTypeOpenStreamResp:
+		return parseOpenStreamRespFrame(r)
+	default:
+		return nil, fmt.Errorf("unknown frame type: %d", t)
+	}
 }

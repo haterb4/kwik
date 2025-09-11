@@ -9,7 +9,6 @@ import (
 	"github.com/s-anzie/kwik/internal/config"
 	"github.com/s-anzie/kwik/internal/logger"
 	"github.com/s-anzie/kwik/internal/protocol"
-
 	"github.com/s-anzie/kwik/internal/transport"
 )
 
@@ -19,7 +18,7 @@ type ClientSession struct {
 	remoteAddr  string
 	mu          sync.Mutex
 	pathMgr     transport.PathManager
-	streamMgr   streamManager
+	streamMgr   *streamManagerImpl
 	logger      logger.Logger
 	packer      *transport.Packer
 	multiplexer *transport.Multiplexer
@@ -41,17 +40,19 @@ func DialAddr(ctx context.Context, address string, tls *tls.Config, cfg *config.
 
 func NewClientSession(address string, tls *tls.Config, cfg *config.Config) *ClientSession {
 	mgr := transport.NewClientPathManager(tls, cfg)
-	packer := transport.NewPacker(1200)
-	multiplexer := transport.NewMultiplexer(packer)
+	packer := transport.NewPacker(1048576)
+
+	// La retransmission sera gérée par le Path, pas à ce niveau
+
 	sess := &ClientSession{
-		id:          0,
-		remoteAddr:  address,
-		pathMgr:     mgr,
-		logger:      logger.NewLogger(logger.LogLevelSilent).WithComponent("CLIENT_SESSION"),
-		packer:      packer,
-		multiplexer: multiplexer,
+		id:         0,
+		remoteAddr: address,
+		pathMgr:    mgr,
+		logger:     logger.NewLogger(logger.LogLevelSilent).WithComponent("CLIENT_SESSION"),
+		packer:     packer,
 	}
 	sess.streamMgr = NewStreamManager(sess)
+	sess.multiplexer = transport.NewMultiplexer(packer, sess.streamMgr)
 	return sess
 }
 
@@ -66,7 +67,7 @@ func (s *ClientSession) Multiplexer() *transport.Multiplexer {
 func (s *ClientSession) PathManager() transport.PathManager {
 	return s.pathMgr
 }
-func (s *ClientSession) StreamManager() streamManager {
+func (s *ClientSession) StreamManager() StreamManager {
 	return s.streamMgr
 }
 
@@ -141,10 +142,10 @@ func (s *ClientSession) AcceptStream(ctx context.Context) (Stream, error) {
 		s.logger.Error("Failed to accept stream", "error", err, "pathID", path.PathID())
 		return nil, fmt.Errorf("failed to accept stream: %w", err)
 	}
-	s.multiplexer.RegisterStream(stream.StreamID())
+
 	s.logger.Debug("Creating new stream", "streamID", stream.StreamID(), "pathID", path.PathID())
 	// Add the path to the stream (this will also register with packer)
-	if err := s.streamMgr.AddStreamPath(stream.StreamID(), path); err != nil {
+	if err := s.streamMgr.AddPathToStream(stream.StreamID(), path); err != nil {
 		s.mu.Unlock()
 		s.streamMgr.RemoveStream(stream.StreamID()) // Clean up if path addition fails
 		path.RemoveStream(stream.StreamID())
@@ -166,35 +167,44 @@ func (s *ClientSession) AcceptStream(ctx context.Context) (Stream, error) {
 
 func (s *ClientSession) OpenStreamSync(ctx context.Context) (Stream, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Get the primary path
-	primaryPath := s.pathMgr.GetPrimaryPath()
-	if primaryPath == nil {
+	path := s.pathMgr.GetPrimaryPath()
+	if path == nil {
+		s.mu.Unlock()
 		return nil, protocol.NewPathNotExistsError(0)
 	}
 
-	s.logger.Debug("Opening stream synchronously", "pathID", primaryPath.PathID())
+	s.logger.Debug("Opening new stream on path", "pathID", path.PathID())
 
-	// Create the stream to get an ID
-	streamImpl := s.streamMgr.CreateStream()
-	streamID := streamImpl.StreamID()
-	s.multiplexer.RegisterStream(streamID)
-	// Open the stream with the generated ID
-	err := primaryPath.OpenStreamSync(ctx, streamID)
-	if err != nil {
-		s.streamMgr.RemoveStream(streamID)
-		return nil, err
+	// Accept a new stream from the client
+	stream := s.streamMgr.CreateStream()
+	if err := path.OpenStreamSync(ctx, stream.StreamID()); err != nil {
+		s.mu.Unlock()
+		s.logger.Error("Failed to open stream", "error", err, "pathID", path.PathID())
+		return nil, fmt.Errorf("failed to open stream: %w", err)
 	}
 
-	// Add the path to the stream
-	if err := s.streamMgr.AddStreamPath(streamID, primaryPath); err != nil {
-		s.streamMgr.RemoveStream(streamID)
-		return nil, err
+	s.logger.Debug("Creating new stream", "streamID", stream.StreamID(), "pathID", path.PathID())
+	// Add the path to the stream (this will also register with packer)
+	if err := s.streamMgr.AddPathToStream(stream.StreamID(), path); err != nil {
+		s.mu.Unlock()
+		s.streamMgr.RemoveStream(stream.StreamID()) // Clean up if path addition fails
+		path.RemoveStream(stream.StreamID())
+		s.logger.Error("Failed to add path to stream",
+			"streamID", stream.StreamID(),
+			"pathID", path.PathID(),
+			"error", err)
+		return nil, fmt.Errorf("failed to add path to stream: %w", err)
 	}
 
-	s.logger.Debug("Successfully opened stream", "streamID", streamID, "pathID", primaryPath.PathID())
-	return streamImpl, nil
+	s.mu.Unlock()
+
+	s.logger.Info("Successfully opened stream",
+		"streamID", stream.StreamID(),
+		"pathID", path.PathID())
+
+	return stream, nil
 }
 
 func (s *ClientSession) OpenStream() (Stream, error) {
@@ -211,7 +221,6 @@ func (s *ClientSession) OpenStream() (Stream, error) {
 	// Generate a new stream ID (odd-numbered for client-initiated streams)
 	streamImpl := s.streamMgr.CreateStream()
 	streamID := streamImpl.StreamID()
-	s.multiplexer.RegisterStream(streamID)
 	s.logger.Debug("Opening new stream", "streamID", streamID, "pathID", path.PathID())
 
 	// Create the stream first
@@ -220,16 +229,12 @@ func (s *ClientSession) OpenStream() (Stream, error) {
 		id:            streamID,
 		paths:         make(map[protocol.PathID]transport.Path),
 		logger:        streamLogger,
-		streamManager: s.streamMgr.(*streamManagerImpl), // Type assertion since streamManager is an interface
+		streamManager: s.streamMgr,
 	}
 
 	// Register the stream with the manager before opening the stream
-	if mgr, ok := s.streamMgr.(*streamManagerImpl); ok {
-		mgr.addStream(stream)
-	} else {
-		s.mu.Unlock()
-		return nil, fmt.Errorf("invalid stream manager type")
-	}
+
+	s.streamMgr.addStream(stream)
 
 	// Now open the stream on the path
 	if err := path.OpenStream(streamID); err != nil {
@@ -282,6 +287,41 @@ func (s *ClientSession) SendRawData(data []byte, pathID protocol.PathID, streamI
 	return nil
 }
 
+// NotifyPathClosed informs all streams that a path has been closed
+// This method is called by path.Close() to notify the client session
+// that a path is being closed, so the streams using that path can be updated.
+func (s *ClientSession) NotifyPathClosed(pathID protocol.PathID, streamIDs []protocol.StreamID) {
+	s.logger.Debug("Notifying streams that path was closed", "pathID", pathID, "streamCount", len(streamIDs))
+
+	// Exclude control stream (ID 0) from notifications
+	var appStreamIDs []protocol.StreamID
+	for _, sid := range streamIDs {
+		if sid != 0 { // Skip control stream
+			appStreamIDs = append(appStreamIDs, sid)
+		}
+	}
+
+	if len(appStreamIDs) == 0 {
+		s.logger.Debug("No application streams to notify about path closure", "pathID", pathID)
+		return
+	}
+
+	// Get the stream manager implementation to access GetStream method
+
+	for _, sid := range appStreamIDs {
+		// Get the stream and remove the path
+		stream, exists := s.streamMgr.GetStream(sid)
+		if !exists {
+			s.logger.Debug("Stream not found when notifying of path closure", "streamID", sid, "pathID", pathID)
+			continue
+		}
+
+		// Remove the path from the stream
+		stream.RemovePath(pathID)
+		s.logger.Debug("Notified stream of path closure", "streamID", sid, "pathID", pathID)
+	}
+}
+
 func (s *ClientSession) CloseWithError(code int, msg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -289,12 +329,18 @@ func (s *ClientSession) CloseWithError(code int, msg string) error {
 	// Log close reason for debugging (who/why closed the session)
 	s.logger.Info("CloseWithError called (client)", "code", code, "msg", msg, "local", s.localAddr, "remote", s.remoteAddr)
 
-	if sm, ok := s.streamMgr.(*streamManagerImpl); ok {
-		sm.CloseAllStreams()
-	}
+	s.streamMgr.CloseAllStreams()
 
 	if pm, ok := s.pathMgr.(interface{ CloseAllPaths() }); ok {
 		pm.CloseAllPaths()
+	}
+
+	// Stop multiplexer and packer background goroutines
+	if s.multiplexer != nil {
+		s.multiplexer.Close()
+	}
+	if s.packer != nil {
+		s.packer.Close()
 	}
 
 	return nil

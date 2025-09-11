@@ -21,7 +21,7 @@ func NewRelay(path Path, address string, pathID protocol.PathID) *relayImpl {
 		pathID:  pathID,
 		active:  true,
 		path:    path,
-		logger:  logger.NewLogger(logger.LogLevelDebug).WithComponent("RELAY"),
+		logger:  logger.NewLogger(logger.LogLevelSilent).WithComponent("RELAY"),
 	}
 }
 
@@ -53,20 +53,51 @@ func (r *relayImpl) SendRawData(data []byte, streamID protocol.StreamID) (int, e
 		return 0, fmt.Errorf("relay path is not available")
 	}
 
-	// Créer la charge utile pour la trame RelayData
-	payload := protocol.EncodeRelayDataPayload(r.pathID, streamID, data)
-
-	// Créer la trame avec le type RelayData
-	seq, _ := r.path.WriteSeq(0)
-	frame := &protocol.Frame{
-		Type:     protocol.FrameTypeRelayData,
-		StreamID: streamID, // On utilise le stream de contrôle (0)
-		Seq:      seq,      // La séquence sera gérée par le packer
-		Payload:  payload,
+	// Vérifier que le path est prêt
+	if !r.path.IsSessionReady() {
+		r.logger.Warn("Relay path session is not ready, but will try to send anyway",
+			"address", r.address,
+			"pathID", r.pathID)
 	}
 
-	// Envoyer la trame via le chemin primaire
-	if err := r.path.SendControlFrame(frame); err != nil {
+	// Create RelayDataFrame using the new fields
+	frame := &protocol.RelayDataFrame{
+		RelayPathID:  r.pathID,
+		DestStreamID: streamID,
+		RawData:      data,
+	}
+
+	// Send the frame via the primary path control stream using internal helper
+	var err error
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		// Utiliser le packer pour toutes les trames
+		var packer interface {
+			SubmitFrame(Path, protocol.Frame) error
+		}
+		if si, ok := r.path.(interface{ sessionInternal() sessionInternal }); ok {
+			packer = si.sessionInternal().Packer()
+		} else if pp, ok := r.path.(*path); ok {
+			if si, ok := pp.session.(sessionInternal); ok {
+				packer = si.Packer()
+			}
+		}
+		if packer != nil {
+			err = packer.SubmitFrame(r.path, frame)
+		} else {
+			err = fmt.Errorf("no packer available for relay path")
+		}
+		if err == nil {
+			break
+		}
+		r.logger.Warn("Failed to send relay data, retrying",
+			"attempt", i+1,
+			"error", err)
+	}
+
+	if err != nil {
+		r.logger.Error("Failed to send relay data after retries",
+			"error", err)
 		return 0, fmt.Errorf("failed to send relay data: %w", err)
 	}
 

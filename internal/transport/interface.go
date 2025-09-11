@@ -18,19 +18,46 @@ type Stream interface {
 	StreamID() protocol.StreamID
 
 	// Secondary stream isolation methods
-	SetWriteOffset(offset int64) error
-	GetWriteOffset() int64
-	SetReadOffset(offset int64) error
-	GetReadOffset() int64
+	SetWriteOffset(offset uint64) error
+	GetWriteOffset() uint64
+	SetReadOffset(offset uint64) error
+	GetReadOffset() uint64
 	SetRemoteStreamID(remoteStreamID protocol.StreamID) error
 	RemoteStreamID() protocol.StreamID
+	RemovePath(pathID protocol.PathID)
 }
 
 type StreamManager interface {
 	GetNextStreamID() protocol.StreamID
 	CreateStream() Stream
-	AddStreamPath(streamID protocol.StreamID, path Path) error
+	GetStream(streamID protocol.StreamID) (Stream, bool)
+	AddPathToStream(streamID protocol.StreamID, path Path) error
 	RemoveStream(streamID protocol.StreamID)
+	// GetStreamFrameHandler returns an optional handler that can accept direct StreamFrame delivery
+	GetStreamFrameHandler(streamID protocol.StreamID) (StreamFrameHandler, bool)
+	// GetSendStreamProvider returns an optional provider that can supply frames for sending
+	GetSendStreamProvider(streamID protocol.StreamID) (SendStreamProvider, bool)
+}
+
+// StreamFrameHandler accepts delivered stream frames for direct in-order reassembly.
+type StreamFrameHandler interface {
+	HandleStreamFrame(f *protocol.StreamFrame)
+}
+
+// SendStreamProvider provides frames ready for packetization from a logical send stream.
+type SendStreamProvider interface {
+	PopFrames(maxBytes int) []*protocol.StreamFrame
+	HasBuffered() bool
+}
+
+// sessionInternal is an unexported interface that exposes transport internals
+// to code inside the transport package only. Other packages cannot reference
+// this type, so it prevents external code from accessing internals directly.
+type sessionInternal interface {
+	Packer() *Packer
+	Multiplexer() *Multiplexer
+	PathManager() PathManager
+	StreamManager() StreamManager
 }
 
 // SessionState represents the current state of a session
@@ -68,16 +95,14 @@ type Path interface {
 	OpenStreamSync(ctx context.Context, streamID protocol.StreamID) error
 	OpenStream(streamID protocol.StreamID) error
 	AcceptStream(ctx context.Context, streamID protocol.StreamID) error
-	// ReadStream reads from the underlying QUIC stream associated with streamID.
-	ReadStream(streamID protocol.StreamID, p []byte) (int, error)
+
 	// WriteStream writes to the underlying QUIC stream associated with streamID.
 	WriteStream(streamID protocol.StreamID, p []byte) (int, error)
 	// HasStream checks if a stream with the given ID exists in this path
 	HasStream(streamID protocol.StreamID) bool
-	// SendControlFrame sends a control frame (handshake, ping, etc.) on the path
-	SendControlFrame(f *protocol.Frame) error
-	// HandleControlFrame is invoked when an inbound control frame (StreamID 0) is received
-	HandleControlFrame(f *protocol.Frame) error
+	// Control frames are sent/received on the reserved control QUIC stream (streamID 0).
+	// Use WriteStream/ReadStream on stream 0 for control traffic; the concrete path
+	// implementation still provides helpers but the interface no longer exposes them.
 	LocalAddr() string
 	RemoteAddr() string
 	RemoveStream(streamID protocol.StreamID)
@@ -92,6 +117,15 @@ type Path interface {
 	// GetLastAcceptedStreamID returns the ID of the last accepted stream
 	GetLastAcceptedStreamID() protocol.StreamID
 	WriteSeq(streamID protocol.StreamID) (uint64, bool)
+	WriteOffsetForStream(streamID protocol.StreamID) uint64
+	IncrementWriteOffsetForStream(streamID protocol.StreamID, n uint64)
+	// Offset synchronization methods for SendStream coordination
+	GetWriteOffset(streamID protocol.StreamID) (uint64, bool)
+	SyncWriteOffset(streamID protocol.StreamID, offset uint64) bool
+	// Internal helpers callable by higher-level code without directly accessing session internals
+	SubmitSendStream(streamID protocol.StreamID) error
+	CancelFramesForStream(streamID protocol.StreamID)
+	CleanupStreamBuffer(streamID protocol.StreamID)
 }
 type Relay interface {
 	Address() string

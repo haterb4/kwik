@@ -23,7 +23,7 @@ type pathManagerImpl struct {
 	primaryPathID      protocol.PathID
 	mu                 sync.Mutex
 	logger             logger.Logger
-	addPathRespChannel chan *protocol.AddPathRespPayload
+	addPathRespChannel chan *protocol.AddPathRespFrame
 }
 
 func NewClientPathManager(tls *tls.Config, cfg *config.Config) *pathManagerImpl {
@@ -33,7 +33,7 @@ func NewClientPathManager(tls *tls.Config, cfg *config.Config) *pathManagerImpl 
 		tlsCfg:        tls,
 		config:        cfg,
 		primaryPathID: 0, // Initialize to 0 (invalid)
-		logger:        logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH_MANAGER"),
+		logger:        logger.NewLogger(logger.LogLevelSilent).WithComponent("PATH_MANAGER"),
 	}
 }
 func NewServerPathManager() *pathManagerImpl {
@@ -41,7 +41,7 @@ func NewServerPathManager() *pathManagerImpl {
 		paths:         make(map[protocol.PathID]*path),
 		nextPathID:    0,
 		primaryPathID: 0, // Initialize to 0 (invalid)
-		logger:        logger.NewLogger(logger.LogLevelDebug).WithComponent("PATH_MANAGER"),
+		logger:        logger.NewLogger(logger.LogLevelSilent).WithComponent("PATH_MANAGER"),
 	}
 }
 
@@ -143,27 +143,24 @@ func (pm *pathManagerImpl) AddRelay(address string) (Relay, error) {
 	}
 
 	// Create a channel to receive the response
-	responseChannel := make(chan *protocol.AddPathRespPayload, 1)
+	responseChannel := make(chan *protocol.AddPathRespFrame, 1)
 
 	// Register a response handler in the path manager
 	pm.registerAddPathRespHandler(responseChannel)
 
 	// 1. Send AddPath frame on primary path
-	payload := protocol.EncodeAddPathPayload(address)
-	frame := &protocol.Frame{
-		Type:     protocol.FrameTypeAddPath,
-		StreamID: 0, // Control stream
-		Seq:      0,
-		Payload:  payload,
-	}
+	frame := &protocol.AddPathFrame{Address: address}
 
-	// Send the frame through the primary path
-	if err := primaryPath.SendControlFrame(frame); err != nil {
-		pm.unregisterAddPathRespHandler()
-		return nil, fmt.Errorf("failed to send AddPath frame: %w", err)
+	// Envoyer la trame via le packer (batching)
+	if si, ok := primaryPath.session.(sessionInternal); ok {
+		packer := si.Packer()
+		if packer != nil {
+			_ = packer.SubmitFrame(primaryPath, frame)
+		}
 	}
 
 	pm.logger.Debug("Sent AddPath request", "address", address)
+	fmt.Printf("TRACK Sent AddPath request: address=%s\n", address)
 
 	// 2. Wait for response synchronously
 	select {
@@ -189,7 +186,7 @@ func (pm *pathManagerImpl) AddRelay(address string) (Relay, error) {
 }
 
 // registerAddPathRespHandler registers a channel to receive AddPathResp responses
-func (pm *pathManagerImpl) registerAddPathRespHandler(ch chan *protocol.AddPathRespPayload) {
+func (pm *pathManagerImpl) registerAddPathRespHandler(ch chan *protocol.AddPathRespFrame) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.addPathRespChannel = ch
@@ -203,7 +200,7 @@ func (pm *pathManagerImpl) unregisterAddPathRespHandler() {
 }
 
 // handleAddPathResp processes an AddPathResp frame and forwards it to the registered channel
-func (pm *pathManagerImpl) handleAddPathResp(frame *protocol.Frame) {
+func (pm *pathManagerImpl) handleAddPathResp(frame *protocol.AddPathRespFrame) {
 	pm.mu.Lock()
 	respChannel := pm.addPathRespChannel
 	pm.mu.Unlock()
@@ -213,17 +210,10 @@ func (pm *pathManagerImpl) handleAddPathResp(frame *protocol.Frame) {
 		return
 	}
 
-	// Decode the response
-	resp, err := protocol.DecodeAddPathRespPayload(frame.Payload)
-	if err != nil {
-		pm.logger.Error("Failed to decode AddPathResp", "error", err)
-		return
-	}
-
-	// Send to the waiting handler
+	// Forward the frame to the waiting handler
 	select {
-	case respChannel <- resp:
-		pm.logger.Debug("Forwarded AddPathResp", "address", resp.Address, "pathID", resp.PathID)
+	case respChannel <- frame:
+		pm.logger.Debug("Forwarded AddPathResp", "address", frame.Address, "pathID", frame.PathID)
 	default:
 		pm.logger.Warn("AddPathResp handler channel is full")
 	}
