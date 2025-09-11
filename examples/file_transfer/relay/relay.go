@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -8,18 +9,37 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/json"
 	"encoding/pem"
 	"io"
 	"log"
 	"math/big"
 	"net"
 	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/s-anzie/kwik"
 )
+
+// CommandType définit le type d'action que le relais doit effectuer.
+type CommandType string
+
+const (
+	CmdSendWindow CommandType = "SEND_WINDOW"
+	CmdFinish     CommandType = "FINISH"
+)
+
+// Command est la structure utilisée par le serveur pour donner des ordres au relais.
+// Cette structure doit être identique à celle du serveur.
+type Command struct {
+	Type            CommandType `json:"type"`
+	FileName        string      `json:"file_name,omitempty"`
+	ChunkSize       int         `json:"chunk_size,omitempty"`
+	StartChunkIndex int         `json:"start_chunk_index,omitempty"`
+	EndChunkIndex   int         `json:"end_chunk_index,omitempty"`
+	Step            int         `json:"step,omitempty"`
+	StartOffset     uint64      `json:"start_offset,omitempty"`
+}
 
 func main() {
 	log.Println("Starting QUIC relay...")
@@ -43,71 +63,122 @@ func main() {
 }
 
 func handleRelaySession(session kwik.Session) {
-	log.Println("New relay session accepted:", session.RemoteAddr())
+	log.Println("New relay session accepted from:", session.RemoteAddr())
+	defer log.Println("Relay session closed for:", session.RemoteAddr())
 
-	// Le relais doit accepter un stream unidirectionnel du serveur pour les commandes
+	// Le relais attend un flux unique du serveur pour recevoir toutes les commandes.
 	stream, err := session.AcceptStream(context.Background())
 	if err != nil {
 		log.Println("Error accepting command stream:", err)
 		return
 	}
+	defer stream.Close()
 
-	// Read command from server
-	buf := make([]byte, 1024)
-	n, err := stream.Read(buf)
-	if err != nil {
-		log.Println("Error reading command:", err)
-		return
+	for {
+		cmdBuf := make([]byte, 2048)
+		n, err := stream.Read(cmdBuf)
+		if err != nil {
+			if err != io.EOF {
+				log.Println("Error reading command:", err)
+			}
+			return
+		}
+
+		var cmd Command
+		err = json.Unmarshal(cmdBuf[:n], &cmd)
+		if err != nil {
+			log.Printf("Failed to unmarshal command: %v", err)
+			continue
+		}
+
+		log.Printf("Received command: %+v", cmd)
+
+		switch cmd.Type {
+		case CmdFinish:
+			log.Println("FINISH command received. Terminating.")
+			return
+
+		case CmdSendWindow:
+			err := processSendWindowCommand(stream, cmd)
+			if err != nil {
+				log.Printf("Error processing window: %v", err)
+				return // En cas d'erreur, on termine la session pour ce relais.
+			}
+
+		default:
+			log.Printf("Unknown command type received: %s", cmd.Type)
+		}
 	}
-	command := string(buf[:n])
-	log.Println("Received command:", command)
+}
 
-	parts := strings.Split(command, " ")
-	if len(parts) != 6 || parts[0] != "SEND" {
-		log.Println("Invalid command")
-		return
-	}
-
-	fileName := parts[1]
-	chunkSize, _ := strconv.Atoi(parts[2])
-	startChunk, _ := strconv.Atoi(parts[3])
-	endChunk, _ := strconv.ParseInt(parts[4], 10, 64)
-	step, _ := strconv.Atoi(parts[5])
-
-	file, err := os.Open(fileName)
+func processSendWindowCommand(stream kwik.Stream, cmd Command) error {
+	file, err := os.Open(cmd.FileName)
 	if err != nil {
-		log.Println("Error opening file:", err)
-		return
+		return err
 	}
 	defer file.Close()
 
 	fileInfo, _ := file.Stat()
 	fileSize := fileInfo.Size()
 
-	for i := startChunk; int64(i) < endChunk; i += step {
-		offset := int64(i * chunkSize)
-		if offset >= fileSize {
+	const chunkHeaderSize = 8 + 4 // uint64 for index, uint32 for size
+
+	// L'offset de départ est celui du premier chunk que le relais doit envoyer.
+	currentRelayOffset := cmd.StartOffset
+
+	// Parcourir la fenêtre de chunks assignée
+	for i := cmd.StartChunkIndex; i < cmd.EndChunkIndex; i++ {
+		// Le relais ne traite que les chunks impairs
+		if i%cmd.Step == 0 {
+			continue
+		}
+
+		// Se positionner au bon offset dans le stream de sortie
+		err := stream.(*kwik.StreamImpl).SetWriteOffset(currentRelayOffset)
+		if err != nil {
+			log.Printf("Failed to set write offset for chunk %d: %v", i, err)
+			return err
+		}
+
+		// Lire les données du fichier
+		fileOffset := int64(i * cmd.ChunkSize)
+		if fileOffset >= fileSize {
 			break
 		}
-		file.Seek(offset, 0)
+		file.Seek(fileOffset, 0)
 
-		// Déterminer la taille réelle du chunk
-		bytesToSend := chunkSize
-		if offset+int64(chunkSize) > fileSize {
-			bytesToSend = int(fileSize - offset)
+		dataSize := cmd.ChunkSize
+		if fileOffset+int64(cmd.ChunkSize) > fileSize {
+			dataSize = int(fileSize - fileOffset)
 		}
-
-		chunkData := make([]byte, bytesToSend)
-		_, err := io.ReadFull(file, chunkData)
+		chunkData := make([]byte, dataSize)
+		_, err = io.ReadFull(file, chunkData)
 		if err != nil {
-			log.Println("Error reading file chunk:", err)
-			return
+			return err
 		}
 
-		binary.Write(stream, binary.LittleEndian, uint32(bytesToSend))
-		stream.Write(chunkData)
+		// Construire le payload applicatif
+		payloadBuf := new(bytes.Buffer)
+		binary.Write(payloadBuf, binary.BigEndian, uint64(i))
+		binary.Write(payloadBuf, binary.BigEndian, uint32(len(chunkData)))
+		payloadBuf.Write(chunkData)
+
+		log.Printf("Relay sending chunk %d at stream offset %d", i, currentRelayOffset)
+		_, err = stream.Write(payloadBuf.Bytes())
+		if err != nil {
+			return err
+		}
+
+		// Mettre à jour l'offset pour le PROCHAIN chunk impair que ce relais enverra
+		// Le saut est de 2 chunks (le pair suivant + l'impair d'après)
+		// NOTE : Cette partie n'est nécessaire que si le relais envoyait plusieurs chunks impairs
+		// à la suite. La simple incrémentation par la taille du payload est suffisante
+		// car Write() avance déjà l'offset.
+		currentRelayOffset = stream.(*kwik.StreamImpl).GetWriteOffset()
 	}
-	log.Println("Relay finished sending chunks for", fileName)
+
+	log.Println("Relay finished sending its chunks for the window.")
+	return nil
 }
 
 // generateTLSConfig crée une configuration TLS auto-signée en mémoire.

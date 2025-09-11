@@ -177,16 +177,9 @@ func (s *PingPongServer) handleStream(stream kwik.Stream, clientAddr string) {
 }
 
 func (s *PingPongServer) readMessage(stream kwik.Stream) (*Message, error) {
-	// Lire la taille du message (8 bytes pour uint64)
-	var msgSize uint64
-	err := binary.Read(stream, binary.BigEndian, &msgSize)
-	if err != nil {
-		return nil, err
-	}
-
-	// Lire le message
-	msgBytes := make([]byte, msgSize)
-	_, err = io.ReadFull(stream, msgBytes)
+	// Lire le message (20 bytes)
+	msgBytes := make([]byte, 20)
+	_, err := io.ReadFull(stream, msgBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +201,8 @@ func (s *PingPongServer) readMessage(stream kwik.Stream) (*Message, error) {
 }
 
 func (s *PingPongServer) writeMessage(stream kwik.Stream, msg Message) error {
+	// TRACK: log chaque demande d'envoi côté serveur (sans streamID)
+	fmt.Printf("TRACK AppServerWrite: type=%s, counter=%d, ts=%d\n", msg.Type, msg.Counter, msg.Timestamp.UnixNano())
 	// Préparer le message
 	msgBytes := make([]byte, 20) // 4 + 8 + 8 bytes
 
@@ -220,14 +215,8 @@ func (s *PingPongServer) writeMessage(stream kwik.Stream, msg Message) error {
 	// Timestamp
 	binary.BigEndian.PutUint64(msgBytes[12:20], uint64(msg.Timestamp.UnixNano()))
 
-	// Écrire la taille du message
-	err := binary.Write(stream, binary.BigEndian, uint64(len(msgBytes)))
-	if err != nil {
-		return err
-	}
-
-	// Écrire le message
-	_, err = stream.Write(msgBytes)
+	// Écrire le message (20 bytes)
+	_, err := stream.Write(msgBytes)
 	return err
 }
 
@@ -326,15 +315,9 @@ func (c *PingPongClient) Start() error {
 }
 
 func (c *PingPongClient) readMessage(stream kwik.Stream) (*Message, error) {
-	// Même implémentation que le serveur
-	var msgSize uint64
-	err := binary.Read(stream, binary.BigEndian, &msgSize)
-	if err != nil {
-		return nil, err
-	}
-
-	msgBytes := make([]byte, msgSize)
-	_, err = io.ReadFull(stream, msgBytes)
+	// Lire le message (20 bytes)
+	msgBytes := make([]byte, 20)
+	_, err := io.ReadFull(stream, msgBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -355,12 +338,7 @@ func (c *PingPongClient) writeMessage(stream kwik.Stream, msg Message) error {
 	binary.BigEndian.PutUint64(msgBytes[4:12], msg.Counter)
 	binary.BigEndian.PutUint64(msgBytes[12:20], uint64(msg.Timestamp.UnixNano()))
 
-	err := binary.Write(stream, binary.BigEndian, uint64(len(msgBytes)))
-	if err != nil {
-		return err
-	}
-
-	_, err = stream.Write(msgBytes)
+	_, err := stream.Write(msgBytes)
 	return err
 }
 

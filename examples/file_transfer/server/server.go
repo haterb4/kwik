@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -10,7 +11,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
-	"fmt"
 	"io"
 	"log"
 	"math/big"
@@ -27,12 +27,34 @@ const (
 	relayAddress = "localhost:4434"
 )
 
+// CommandType définit le type d'action que le relais doit effectuer.
+type CommandType string
+
+const (
+	CmdSendWindow CommandType = "SEND_WINDOW"
+	CmdFinish     CommandType = "FINISH"
+)
+
+// Command est la structure utilisée par le serveur pour donner des ordres au relais.
+type Command struct {
+	Type            CommandType `json:"type"`
+	FileName        string      `json:"file_name,omitempty"`
+	ChunkSize       int         `json:"chunk_size,omitempty"`
+	StartChunkIndex int         `json:"start_chunk_index,omitempty"`
+	EndChunkIndex   int         `json:"end_chunk_index,omitempty"`
+	Step            int         `json:"step,omitempty"`
+	// StartOffset est l'offset absolu où le relais doit commencer à écrire son premier chunk.
+	StartOffset uint64 `json:"start_offset,omitempty"`
+}
+
+// FileMetadata est la structure envoyée au client.
 type FileMetadata struct {
-	FileName       string
-	FileSize       int64
-	TotalWindows   int
-	WindowSize     int
-	LastWindowSize int
+	FileName             string
+	FileSize             int64
+	ChunkSize            int
+	WindowSizeChunks     int
+	TotalWindows         int
+	LastWindowSizeChunks int
 }
 
 func main() {
@@ -44,7 +66,6 @@ func main() {
 		log.Fatal(err)
 	}
 	defer listener.Close()
-
 	log.Println("Server listening on localhost:4433")
 
 	for {
@@ -64,25 +85,21 @@ func handleSession(session kwik.Session) {
 		log.Println("Error accepting stream:", err)
 		return
 	}
-	// Ne fermez pas le stream ici pour permettre la communication continue (ACKs)
+	defer stream.Close()
 
-	// Read file request
 	buf := make([]byte, 1024)
 	n, err := stream.Read(buf)
 	if err != nil {
 		log.Println("Error reading file request:", err)
-		stream.Close()
 		return
 	}
 	fileName := string(buf[:n])
 	log.Println("Received request for file:", fileName)
 
-	// Open the requested file
 	file, err := os.Open(fileName)
 	if err != nil {
 		log.Println("Error opening file:", err)
 		stream.Write([]byte("File not found"))
-		stream.Close()
 		return
 	}
 	defer file.Close()
@@ -91,95 +108,180 @@ func handleSession(session kwik.Session) {
 	fileSize := fileInfo.Size()
 	totalChunks := (fileSize + chunkSize - 1) / chunkSize
 	totalWindows := (totalChunks + windowSize - 1) / windowSize
+	lastWindowSize := int(totalChunks) % windowSize
+	if lastWindowSize == 0 && totalChunks > 0 {
+		lastWindowSize = windowSize
+	}
 
 	metadata := FileMetadata{
-		FileName:       fileName,
-		FileSize:       fileSize,
-		TotalWindows:   int(totalWindows),
-		WindowSize:     windowSize,
-		LastWindowSize: int(totalChunks) % windowSize,
-	}
-	if metadata.LastWindowSize == 0 && totalChunks > 0 {
-		metadata.LastWindowSize = windowSize
+		FileName:             fileName,
+		FileSize:             fileSize,
+		ChunkSize:            chunkSize,
+		WindowSizeChunks:     windowSize,
+		TotalWindows:         int(totalWindows),
+		LastWindowSizeChunks: lastWindowSize,
 	}
 
-	// Send metadata to client
 	metaBytes, _ := json.Marshal(metadata)
 	_, err = stream.Write(metaBytes)
 	if err != nil {
 		log.Println("Error sending metadata:", err)
-		stream.Close()
 		return
 	}
 
-	// Setup relay
 	relay, err := session.AddRelay(relayAddress)
 	if err != nil {
-		log.Printf("Erreur création relay: %v\n", err)
-		stream.Close()
+		log.Printf("Error creating relay: %v\n", err)
 		return
 	}
-	go func() {
-		fmt.Printf("Nouvelle connexion établie vers le relay %d\n", relay.PathID())
-		command := fmt.Sprintf("SEND %s %d %d %d %d", fileName, chunkSize, 1, totalChunks, 2) // start at chunk 1, step 2
+	log.Printf("Connection established to relay (PathID: %d)\n", relay.PathID())
 
-		// Le stream ID est déjà connu du contexte de la session du relais
-		relay.SendRawData([]byte(command), stream.StreamID()) // StreamID 0 car le relais ouvrira son propre stream
-	}()
+	// L'en-tête de chaque "message" de chunk (index + taille)
+	const chunkHeaderSize = 8 + 4 // uint64 + uint32
 
-	// Send even chunks
 	for i := 0; i < metadata.TotalWindows; i++ {
-		startChunk := i * windowSize
-
-		// Calcul de la taille de la fenêtre actuelle
-		currentWindowSize := windowSize
+		startChunkOfWindow := i * windowSize
+		chunksInThisWindow := metadata.WindowSizeChunks
 		if i == metadata.TotalWindows-1 {
-			currentWindowSize = metadata.LastWindowSize
+			chunksInThisWindow = metadata.LastWindowSizeChunks
+		}
+		endChunkOfWindow := startChunkOfWindow + chunksInThisWindow
+		log.Printf("[Window %d] Processing chunks from %d to %d", i, startChunkOfWindow, endChunkOfWindow-1)
+
+		// --- Calcul des offsets pour tous les chunks dans l'ordre ---
+		// Créer un mapping des offsets pour chaque chunk dans cette fenêtre
+		chunkOffsets := make(map[int]uint64)
+		currentOffset := stream.(*kwik.StreamImpl).GetWriteOffset()
+
+		log.Printf("[Window %d] Starting with stream offset: %d", i, currentOffset)
+
+		// Calculer les offsets pour tous les chunks dans l'ordre séquentiel
+		for j := startChunkOfWindow; j < endChunkOfWindow; j++ {
+			chunkOffsets[j] = currentOffset
+
+			// Calculer la taille de ce chunk
+			dataSize := chunkSize
+			if int64(j) == totalChunks-1 {
+				dataSize = int(fileSize - (totalChunks-1)*chunkSize)
+			}
+
+			chunkTotalSize := uint64(chunkHeaderSize + dataSize)
+			currentOffset += chunkTotalSize
+
+			log.Printf("[Window %d] Chunk %d will be at offset %d, size %d", i, j, chunkOffsets[j], chunkTotalSize)
 		}
 
-		endChunk := startChunk + currentWindowSize
-
-		for j := startChunk; j < endChunk; j += 2 {
-			if int64(j) >= totalChunks {
-				continue
+		// --- Orchestration du Relais ---
+		// Trouver le premier chunk impair et calculer son offset
+		firstOddChunkIndex := -1
+		for j := startChunkOfWindow; j < endChunkOfWindow; j++ {
+			if j%2 != 0 {
+				firstOddChunkIndex = j
+				break
 			}
-			offset := int64(j * chunkSize)
-			file.Seek(offset, 0)
+		}
 
-			// Déterminer la taille réelle du chunk (surtout pour le dernier)
-			bytesToSend := chunkSize
-			if offset+int64(chunkSize) > fileSize {
-				bytesToSend = int(fileSize - offset)
+		if firstOddChunkIndex != -1 {
+			relayStartOffset := chunkOffsets[firstOddChunkIndex]
+
+			cmd := Command{
+				Type:            CmdSendWindow,
+				FileName:        fileName,
+				ChunkSize:       chunkSize,
+				StartChunkIndex: startChunkOfWindow,
+				EndChunkIndex:   endChunkOfWindow,
+				Step:            2, // Relais gère les chunks impairs
+				StartOffset:     relayStartOffset,
+			}
+			cmdBytes, _ := json.Marshal(cmd)
+			log.Printf("[Window %d] Sending command to relay with start offset %d for chunk %d", i, cmd.StartOffset, firstOddChunkIndex)
+			_, err := relay.SendRawData(cmdBytes, stream.StreamID())
+			if err != nil {
+				log.Printf("[Window %d] Failed to send command to relay: %v", i, err)
+				return
+			}
+		}
+
+		// --- Envoi des données du Serveur (chunks pairs uniquement) ---
+		for j := startChunkOfWindow; j < endChunkOfWindow; j++ {
+			if j%2 != 0 {
+				continue // Le relais gère les chunks impairs
 			}
 
-			chunkData := make([]byte, bytesToSend)
+			// Positionner le stream à l'offset calculé pour ce chunk
+			targetOffset := chunkOffsets[j]
+			log.Printf("[Window %d] Setting server stream offset to %d for chunk %d", i, targetOffset, j)
+			err = stream.(*kwik.StreamImpl).SetWriteOffset(targetOffset)
+			if err != nil {
+				log.Printf("Failed to set write offset: %v", err)
+				return
+			}
+
+			// Lire les données du fichier
+			fileOffset := int64(j * chunkSize)
+			file.Seek(fileOffset, 0)
+
+			dataSize := chunkSize
+			if fileOffset+int64(chunkSize) > fileSize {
+				dataSize = int(fileSize - fileOffset)
+			}
+			chunkData := make([]byte, dataSize)
 			_, err := io.ReadFull(file, chunkData)
 			if err != nil {
 				log.Println("Error reading file chunk:", err)
-				stream.Close()
 				return
 			}
-			binary.Write(stream, binary.LittleEndian, uint32(bytesToSend))
-			stream.Write(chunkData)
+
+			// Construire le payload du chunk
+			payloadBuf := new(bytes.Buffer)
+			binary.Write(payloadBuf, binary.BigEndian, uint64(j))
+			binary.Write(payloadBuf, binary.BigEndian, uint32(len(chunkData)))
+			payloadBuf.Write(chunkData)
+
+			log.Printf("[Window %d] Server writing chunk %d at stream offset %d", i, j, stream.(*kwik.StreamImpl).GetWriteOffset())
+			_, err = stream.Write(payloadBuf.Bytes())
+			if err != nil {
+				log.Printf("Failed to write chunk %d: %v", j, err)
+				return
+			}
 		}
 
-		// Wait for ACK
-		ackBuf := make([]byte, 3)
-		_, err := stream.Read(ackBuf)
+		// --- Positionner l'offset final pour la prochaine fenêtre ---
+		finalOffset := currentOffset // currentOffset contient déjà l'offset final calculé
+		log.Printf("[Window %d] Setting final stream offset to %d for next window", i, finalOffset)
+		stream.(*kwik.StreamImpl).SetWriteOffset(finalOffset)
+
+		// --- Attente de l'ACK (length-prefixed to avoid boundary issues) ---
+		var lenBuf [4]byte
+		_, err = io.ReadFull(stream, lenBuf[:])
 		if err != nil {
-			log.Println("Error receiving ACK:", err)
-			stream.Close()
+			log.Println("Error receiving ACK length:", err)
+			return
+		}
+		payloadLen := binary.BigEndian.Uint32(lenBuf[:])
+		if payloadLen == 0 || payloadLen > 1024 {
+			log.Println("Invalid ACK length:", payloadLen)
+			return
+		}
+		ackBuf := make([]byte, payloadLen)
+		_, err = io.ReadFull(stream, ackBuf)
+		if err != nil {
+			log.Println("Error receiving ACK payload:", err)
 			return
 		}
 		if string(ackBuf) != "ACK" {
-			log.Println("Invalid ACK received")
-			stream.Close()
+			log.Printf("Invalid ACK received: %q", string(ackBuf))
 			return
 		}
 		log.Printf("Received ACK for window %d\n", i)
 	}
-	log.Println("File transfer completed for", fileName)
-	stream.Close()
+
+	log.Println("File transfer complete. Sending FINISH to relay.")
+	finishCmd := Command{Type: CmdFinish}
+	finishCmdBytes, _ := json.Marshal(finishCmd)
+	relay.SendRawData(finishCmdBytes, stream.StreamID())
+
+	log.Println("File transfer process finished for", fileName)
 }
 
 // generateTLSConfig crée une configuration TLS auto-signée en mémoire.
