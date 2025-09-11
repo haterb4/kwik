@@ -161,8 +161,9 @@ func handleSession(session kwik.Session) {
 
 			// Calculer la taille de ce chunk
 			dataSize := chunkSize
-			if int64(j) == totalChunks-1 {
-				dataSize = int(fileSize - (totalChunks-1)*chunkSize)
+			fileOffset := int64(j * chunkSize)
+			if fileOffset+int64(chunkSize) > fileSize {
+				dataSize = int(fileSize - fileOffset)
 			}
 
 			chunkTotalSize := uint64(chunkHeaderSize + dataSize)

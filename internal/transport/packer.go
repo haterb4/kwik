@@ -46,7 +46,7 @@ func NewPacker(maxPacketSize int) *Packer {
 	p := &Packer{
 		queues:           make(map[protocol.PathID][]protocol.Frame),
 		maxPacketSize:    maxPacketSize,
-		logger:           logger.NewLogger(logger.LogLevelSilent).WithComponent("PACKER"),
+		logger:           logger.NewLogger(logger.LogLevelDebug).WithComponent("PACKER"),
 		nextPacketSeq:    make(map[protocol.PathID]uint64),
 		pending:          make(map[protocol.PathID]map[uint64]*pendingPacket),
 		paths:            make(map[protocol.PathID]Path),
@@ -771,14 +771,10 @@ func (p *Packer) SubmitFromSendStream(path Path, streamID protocol.StreamID) err
 	}
 	p.mu.Unlock()
 
-	var seqBuf [8]byte
-	binary.BigEndian.PutUint64(seqBuf[:], seq)
-	outWithSeq := append(seqBuf[:], out...)
-
 	// TRACK: juste avant l'appel à WriteStream
-	fmt.Printf("TRACK PacketBuild: pathID=%d, seq=%d, size=%d, carrier=%d, first_bytes=% x\n", pid, seq, len(outWithSeq), carrier, outWithSeq[:min(8, len(outWithSeq))])
-	p.logger.Debug("WriteStream (sendBufferedStream)", "path", pid, "seq", seq, "carrier", carrier, "bytes", len(outWithSeq), "first_bytes", fmt.Sprintf("% x", outWithSeq[:min(8, len(outWithSeq))]))
-	_, err = path.WriteStream(carrier, outWithSeq)
+	fmt.Printf("TRACK PacketBuild: pathID=%d, seq=%d, size=%d, carrier=%d, first_bytes=% x\n", pid, seq, len(out), carrier, out[:min(8, len(out))])
+	p.logger.Debug("WriteStream (sendBufferedStream)", "path", pid, "seq", seq, "carrier", carrier, "bytes", len(out), "first_bytes", fmt.Sprintf("% x", out[:min(8, len(out))]))
+	_, err = path.WriteStream(carrier, out)
 	if err != nil {
 		p.logger.Error("failed to write packet from send stream", "path", pid, "err", err)
 		return err

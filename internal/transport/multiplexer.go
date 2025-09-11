@@ -25,7 +25,7 @@ type ReceptionBuffer struct {
 func NewReceptionBuffer(streamID protocol.StreamID) *ReceptionBuffer {
 	return &ReceptionBuffer{
 		streamBuffer: NewStreamBuffer(),
-		logger:       logger.NewLogger(logger.LogLevelSilent).WithComponent(fmt.Sprintf("RECEPTION_BUFFER_%d", streamID)),
+		logger:       logger.NewLogger(logger.LogLevelDebug).WithComponent(fmt.Sprintf("RECEPTION_BUFFER_%d", streamID)),
 		seen:         make(map[string]struct{}),
 		streamID:     streamID,
 	}
@@ -103,7 +103,7 @@ type Multiplexer struct {
 func NewMultiplexer(packer *Packer, sm StreamManager) *Multiplexer {
 	m := &Multiplexer{
 		streamManager:              sm,
-		logger:                     logger.NewLogger(logger.LogLevelSilent).WithComponent("MULTIPLEXER"),
+		logger:                     logger.NewLogger(logger.LogLevelDebug).WithComponent("MULTIPLEXER"),
 		packer:                     packer,
 		receptionBuffers:           make(map[protocol.StreamID]*ReceptionBuffer),
 		received:                   make(map[protocol.PathID]map[uint64]struct{}),
@@ -158,8 +158,12 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 			m.lastSeenPacketSeqForStream[streamID] = parsed.Header.PacketNum
 			m.mu.Unlock()
 
+			// Log whether this is from primary or relay path
+			fmt.Printf("TRACK StreamFrame: streamID=%d pathID=%d offset=%d dataLen=%d\n", streamID, pathID, f.Offset, len(f.Data))
+
 			// Direct delivery to stream handler if present
 			if handler, ok := m.streamManager.GetStreamFrameHandler(streamID); ok {
+				fmt.Printf("TRACK StreamFrame: Delivering to handler streamID=%d pathID=%d\n", streamID, pathID)
 				handler.HandleStreamFrame(f)
 				m.logger.Debug("Delivered frame directly to stream handler", "streamID", streamID, "offset", f.Offset, "size", len(f.Data))
 				continue
@@ -168,10 +172,12 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 			// Ensure stream exists
 			_, exists := m.streamManager.GetStream(streamID)
 			if !exists {
+				fmt.Printf("TRACK StreamFrame: Unregistered stream streamID=%d pathID=%d - IGNORING\n", streamID, pathID)
 				m.logger.Warn("Frame for unregistered stream received, ignoring", "streamID", streamID)
 				continue
 			}
 
+			fmt.Printf("TRACK StreamFrame: Adding to buffer streamID=%d pathID=%d offset=%d\n", streamID, pathID, f.Offset)
 			receptionBuffer := m.getOrCreateReceptionBuffer(streamID)
 			receptionBuffer.PushStreamFrame(f)
 			if m.notifier != nil {

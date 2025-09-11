@@ -123,34 +123,37 @@ func processSendWindowCommand(stream kwik.Stream, cmd Command) error {
 
 	const chunkHeaderSize = 8 + 4 // uint64 for index, uint32 for size
 
-	// L'offset de départ est celui du premier chunk que le relais doit envoyer.
-	currentRelayOffset := cmd.StartOffset
+	// StartOffset est l'offset d'écriture au moment de commencer cette fenêtre
+	// On itère chunk par chunk en incrémentant l'offset, même pour les chunks qu'on saute
+	currentOffset := cmd.StartOffset
 
 	// Parcourir la fenêtre de chunks assignée
-	for i := cmd.StartChunkIndex; i < cmd.EndChunkIndex; i++ {
-		// Le relais ne traite que les chunks impairs
+	for i := cmd.StartChunkIndex + 1; i < cmd.EndChunkIndex; i++ {
+		// Calculer la taille de ce chunk
+		dataSize := cmd.ChunkSize
+		fileOffset := int64(i * cmd.ChunkSize)
+		if fileOffset+int64(cmd.ChunkSize) > fileSize {
+			dataSize = int(fileSize - fileOffset)
+		}
+		chunkTotalSize := uint64(chunkHeaderSize + dataSize)
+
+		// Le relais ne traite que les chunks impairs (step=2, donc pairs=0, impairs=1)
 		if i%cmd.Step == 0 {
+			// Chunk pair : on saute mais on incrémente l'offset
+			currentOffset += chunkTotalSize
 			continue
 		}
 
-		// Se positionner au bon offset dans le stream de sortie
-		err := stream.(*kwik.StreamImpl).SetWriteOffset(currentRelayOffset)
+		// Chunk impair : on écrit à l'offset courant
+		err := stream.(*kwik.StreamImpl).SetWriteOffset(currentOffset)
 		if err != nil {
 			log.Printf("Failed to set write offset for chunk %d: %v", i, err)
 			return err
 		}
 
 		// Lire les données du fichier
-		fileOffset := int64(i * cmd.ChunkSize)
-		if fileOffset >= fileSize {
-			break
-		}
 		file.Seek(fileOffset, 0)
 
-		dataSize := cmd.ChunkSize
-		if fileOffset+int64(cmd.ChunkSize) > fileSize {
-			dataSize = int(fileSize - fileOffset)
-		}
 		chunkData := make([]byte, dataSize)
 		_, err = io.ReadFull(file, chunkData)
 		if err != nil {
@@ -163,18 +166,14 @@ func processSendWindowCommand(stream kwik.Stream, cmd Command) error {
 		binary.Write(payloadBuf, binary.BigEndian, uint32(len(chunkData)))
 		payloadBuf.Write(chunkData)
 
-		log.Printf("Relay sending chunk %d at stream offset %d", i, currentRelayOffset)
+		log.Printf("Relay sending chunk %d at stream offset %d", i, currentOffset)
 		_, err = stream.Write(payloadBuf.Bytes())
 		if err != nil {
 			return err
 		}
 
-		// Mettre à jour l'offset pour le PROCHAIN chunk impair que ce relais enverra
-		// Le saut est de 2 chunks (le pair suivant + l'impair d'après)
-		// NOTE : Cette partie n'est nécessaire que si le relais envoyait plusieurs chunks impairs
-		// à la suite. La simple incrémentation par la taille du payload est suffisante
-		// car Write() avance déjà l'offset.
-		currentRelayOffset = stream.(*kwik.StreamImpl).GetWriteOffset()
+		// Incrémenter l'offset pour le prochain chunk
+		currentOffset += chunkTotalSize
 	}
 
 	log.Println("Relay finished sending its chunks for the window.")

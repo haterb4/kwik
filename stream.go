@@ -389,6 +389,15 @@ func (s *StreamImpl) SetWriteOffset(offset uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.writeOffset = offset
+
+	// Synchroniser avec le SendStream si il existe
+	if s.send != nil {
+		s.send.mu.Lock()
+		s.send.baseOffset = offset
+		s.send.writeOffset = offset
+		s.send.mu.Unlock()
+	}
+
 	return nil
 }
 
