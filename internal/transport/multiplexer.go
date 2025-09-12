@@ -25,7 +25,7 @@ type ReceptionBuffer struct {
 func NewReceptionBuffer(streamID protocol.StreamID) *ReceptionBuffer {
 	return &ReceptionBuffer{
 		streamBuffer: NewStreamBuffer(),
-		logger:       logger.NewLogger(logger.LogLevelDebug).WithComponent(fmt.Sprintf("RECEPTION_BUFFER_%d", streamID)),
+		logger:       logger.NewLogger(logger.LogLevelSilent).WithComponent(fmt.Sprintf("RECEPTION_BUFFER_%d", streamID)),
 		seen:         make(map[string]struct{}),
 		streamID:     streamID,
 	}
@@ -103,7 +103,7 @@ type Multiplexer struct {
 func NewMultiplexer(packer *Packer, sm StreamManager) *Multiplexer {
 	m := &Multiplexer{
 		streamManager:              sm,
-		logger:                     logger.NewLogger(logger.LogLevelDebug).WithComponent("MULTIPLEXER"),
+		logger:                     logger.NewLogger(logger.LogLevelSilent).WithComponent("MULTIPLEXER"),
 		packer:                     packer,
 		receptionBuffers:           make(map[protocol.StreamID]*ReceptionBuffer),
 		received:                   make(map[protocol.PathID]map[uint64]struct{}),
@@ -139,18 +139,18 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 		m.logger.Error("failed to deserialize packet", "path", pathID, "err", err)
 		return err
 	}
-	fmt.Printf("TRACK PushPacket: Deserialized packet pathID=%d packetNum=%d frameCount=%d\n", pathID, parsed.Header.PacketNum, len(parsed.Payload))
+	// fmt.Printf("TRACK PushPacket: Deserialized packet pathID=%d packetNum=%d frameCount=%d\n", pathID, parsed.Header.PacketNum, len(parsed.Payload))
 	m.recordReceivedPacket(pathID, parsed.Header.PacketNum)
 
 	for _, fr := range parsed.Payload {
 		switch f := fr.(type) {
 		case *protocol.AckFrame:
-			fmt.Printf("TRACK PushPacket: Received Ack frame: %v\n", fr)
+			// fmt.Printf("TRACK PushPacket: Received Ack frame: %v\n", fr)
 			if m.packer != nil {
 				m.packer.OnAck(pathID, f.AckRanges)
 			}
 		case *protocol.StreamFrame:
-			fmt.Printf("TRACK PushPacket: Received Stream frame: %v\n", fr)
+			// fmt.Printf("TRACK PushPacket: Received Stream frame: %v\n", fr)
 			streamID := protocol.StreamID(f.StreamID)
 			// Record last seen path/packet for this stream
 			m.mu.Lock()
@@ -159,11 +159,11 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 			m.mu.Unlock()
 
 			// Log whether this is from primary or relay path
-			fmt.Printf("TRACK StreamFrame: streamID=%d pathID=%d offset=%d dataLen=%d\n", streamID, pathID, f.Offset, len(f.Data))
+			// fmt.Printf("TRACK StreamFrame: streamID=%d pathID=%d offset=%d dataLen=%d\n", streamID, pathID, f.Offset, len(f.Data))
 
 			// Direct delivery to stream handler if present
 			if handler, ok := m.streamManager.GetStreamFrameHandler(streamID); ok {
-				fmt.Printf("TRACK StreamFrame: Delivering to handler streamID=%d pathID=%d\n", streamID, pathID)
+				// fmt.Printf("TRACK StreamFrame: Delivering to handler streamID=%d pathID=%d\n", streamID, pathID)
 				handler.HandleStreamFrame(f)
 				m.logger.Debug("Delivered frame directly to stream handler", "streamID", streamID, "offset", f.Offset, "size", len(f.Data))
 				continue
@@ -172,12 +172,12 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 			// Ensure stream exists
 			_, exists := m.streamManager.GetStream(streamID)
 			if !exists {
-				fmt.Printf("TRACK StreamFrame: Unregistered stream streamID=%d pathID=%d - IGNORING\n", streamID, pathID)
+				// fmt.Printf("TRACK StreamFrame: Unregistered stream streamID=%d pathID=%d - IGNORING\n", streamID, pathID)
 				m.logger.Warn("Frame for unregistered stream received, ignoring", "streamID", streamID)
 				continue
 			}
 
-			fmt.Printf("TRACK StreamFrame: Adding to buffer streamID=%d pathID=%d offset=%d\n", streamID, pathID, f.Offset)
+			// fmt.Printf("TRACK StreamFrame: Adding to buffer streamID=%d pathID=%d offset=%d\n", streamID, pathID, f.Offset)
 			receptionBuffer := m.getOrCreateReceptionBuffer(streamID)
 			receptionBuffer.PushStreamFrame(f)
 			if m.notifier != nil {
@@ -186,7 +186,7 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 			m.logger.Debug("Frame added to reception buffer and notifier called", "streamID", streamID, "offset", f.Offset, "size", len(f.Data))
 		default:
 			// Control frames (Handshake, Ping, AddPath, RelayData, etc.)
-			fmt.Printf("TRACK PushPacket: Received Control frame: %v\n", fr)
+			// fmt.Printf("TRACK PushPacket: Received Control frame: %v\n", fr)
 			if regPath := m.packer.GetRegisteredPath(pathID); regPath != nil {
 				m.logger.Debug("dispatching control frame to path handler", "path", pathID)
 				if pc, ok := regPath.(*path); ok {

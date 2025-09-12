@@ -22,8 +22,9 @@ import (
 )
 
 const (
-	chunkSize    = 65536 // 64KB
-	windowSize   = 10    // 10 chunks per window
+	chunkSize    = 800 * 1024                               // 800KB per chunk
+	windowSizeMB = 10                                       // 10MB per window
+	windowSize   = (windowSizeMB * 1024 * 1024) / chunkSize // ~12-13 chunks per window (10MB / 800KB)
 	relayAddress = "localhost:4434"
 )
 
@@ -106,8 +107,14 @@ func handleSession(session kwik.Session) {
 
 	fileInfo, _ := file.Stat()
 	fileSize := fileInfo.Size()
-	totalChunks := (fileSize + chunkSize - 1) / chunkSize
-	totalWindows := (totalChunks + windowSize - 1) / windowSize
+
+	// Calcul du nombre total de chunks
+	totalChunks := (fileSize + int64(chunkSize) - 1) / int64(chunkSize)
+
+	// Calcul du nombre de fenêtres basé sur les chunks
+	totalWindows := (totalChunks + int64(windowSize) - 1) / int64(windowSize)
+
+	// Calcul des chunks dans la dernière fenêtre
 	lastWindowSize := int(totalChunks) % windowSize
 	if lastWindowSize == 0 && totalChunks > 0 {
 		lastWindowSize = windowSize
@@ -252,29 +259,33 @@ func handleSession(session kwik.Session) {
 		log.Printf("[Window %d] Setting final stream offset to %d for next window", i, finalOffset)
 		stream.(*kwik.StreamImpl).SetWriteOffset(finalOffset)
 
-		// --- Attente de l'ACK (length-prefixed to avoid boundary issues) ---
-		var lenBuf [4]byte
-		_, err = io.ReadFull(stream, lenBuf[:])
-		if err != nil {
-			log.Println("Error receiving ACK length:", err)
-			return
+		// --- Attente de l'ACK seulement pour les fenêtres qui ne sont pas la dernière ---
+		if i < metadata.TotalWindows-1 {
+			var lenBuf [4]byte
+			_, err = io.ReadFull(stream, lenBuf[:])
+			if err != nil {
+				log.Println("Error receiving ACK length:", err)
+				return
+			}
+			payloadLen := binary.BigEndian.Uint32(lenBuf[:])
+			if payloadLen == 0 || payloadLen > 1024 {
+				log.Println("Invalid ACK length:", payloadLen)
+				return
+			}
+			ackBuf := make([]byte, payloadLen)
+			_, err = io.ReadFull(stream, ackBuf)
+			if err != nil {
+				log.Println("Error receiving ACK payload:", err)
+				return
+			}
+			if string(ackBuf) != "ACK" {
+				log.Printf("Invalid ACK received: %q", string(ackBuf))
+				return
+			}
+			log.Printf("Received ACK for window %d", i)
+		} else {
+			log.Printf("Last window %d - no ACK expected", i)
 		}
-		payloadLen := binary.BigEndian.Uint32(lenBuf[:])
-		if payloadLen == 0 || payloadLen > 1024 {
-			log.Println("Invalid ACK length:", payloadLen)
-			return
-		}
-		ackBuf := make([]byte, payloadLen)
-		_, err = io.ReadFull(stream, ackBuf)
-		if err != nil {
-			log.Println("Error receiving ACK payload:", err)
-			return
-		}
-		if string(ackBuf) != "ACK" {
-			log.Printf("Invalid ACK received: %q", string(ackBuf))
-			return
-		}
-		log.Printf("Received ACK for window %d\n", i)
 	}
 
 	log.Println("File transfer complete. Sending FINISH to relay.")

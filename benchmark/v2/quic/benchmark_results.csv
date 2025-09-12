@@ -1,0 +1,7 @@
+test_name,timestamp,duration_ms,concurrent_clients,message_size,total_requests,successful_requests,failed_requests,requests_per_second,avg_latency_ms,median_latency_ms,p95_latency_ms,p99_latency_ms,min_latency_ms,max_latency_ms,throughput_mbps,cpu_usage,memory_usage_mb,network_latency_ms,packet_loss,bandwidth_mbps
+baseline_performance,2025-09-12T11:05:23+02:00,1187,10,1024,1000,1000,0,842.21,0,0,3,4,0,7,13.16,50.2,148,10,0.0,100
+high_concurrency,2025-09-12T11:05:25+02:00,2619,100,512,5000,4975,25,1899.38,4,0,16,63,0,294,14.84,95.2,328,20,0.1,1000
+large_payload,2025-09-12T11:05:27+02:00,1322,20,65536,400,400,0,302.53,4,2,15,20,0,27,302.53,55.2,168,50,0.5,100
+poor_network,2025-09-12T11:05:29+02:00,6131,25,2048,750,750,0,122.32,0,0,1,5,0,14,3.82,57.7,178,200,2.0,10
+no_keep_alive,2025-09-12T11:05:35+02:00,1322,50,1024,2000,2000,0,1512.38,0,0,3,9,0,16,23.63,70.2,228,30,0.2,100
+streaming_test,2025-09-12T11:05:37+02:00,2960,15,32768,1500,1500,0,506.75,2,1,5,10,0,17,253.37,52.7,158,25,0.3,500

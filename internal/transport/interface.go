@@ -83,6 +83,7 @@ type Session interface {
 	SessionID() protocol.SessionID
 	SendRawData(data []byte, pathID protocol.PathID, streamID protocol.StreamID) error
 	CloseWithError(code int, msg string) error
+	Context() context.Context
 	// Transport layer access
 	Packer() *Packer
 	Multiplexer() *Multiplexer

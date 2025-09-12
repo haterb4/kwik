@@ -5,3 +5,11 @@ bin/
 **/*.log
 **/log.txt
 **/*.txt
+*.out
+**/*.out
+*.exe
+**/*.exe
+*.bin
+**/*.bin
+*.mp4
+**/*.mp4

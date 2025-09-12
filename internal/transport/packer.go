@@ -46,7 +46,7 @@ func NewPacker(maxPacketSize int) *Packer {
 	p := &Packer{
 		queues:           make(map[protocol.PathID][]protocol.Frame),
 		maxPacketSize:    maxPacketSize,
-		logger:           logger.NewLogger(logger.LogLevelDebug).WithComponent("PACKER"),
+		logger:           logger.NewLogger(logger.LogLevelSilent).WithComponent("PACKER"),
 		nextPacketSeq:    make(map[protocol.PathID]uint64),
 		pending:          make(map[protocol.PathID]map[uint64]*pendingPacket),
 		paths:            make(map[protocol.PathID]Path),
@@ -77,7 +77,7 @@ func NewPacker(maxPacketSize int) *Packer {
 func (p *Packer) SubmitFrame(path Path, nf protocol.Frame) error {
 	pid := path.PathID()
 	if nf.Type() == protocol.FrameTypeStream {
-		fmt.Printf("TRACK SubmitFrame Received Frame: %v pathID=%d\n", nf.String(), pid)
+		// fmt.Printf("TRACK SubmitFrame Received Frame: %v pathID=%d\n", nf.String(), pid)
 	}
 	p.mu.Lock()
 	p.queues[pid] = append(p.queues[pid], nf)
@@ -124,7 +124,7 @@ func (p *Packer) SubmitFrame(path Path, nf protocol.Frame) error {
 	}
 
 	// TRACK: juste avant le test assembled vide
-	fmt.Printf("TRACK SubmitFrame: pathID=%d, frames=%d\n", pid, len(assembled))
+	// fmt.Printf("TRACK SubmitFrame: pathID=%d, frames=%d\n", pid, len(assembled))
 	if len(assembled) == 0 {
 		p.logger.Debug("SubmitFrame no frames assembled", "path", pid)
 		p.mu.Unlock()
@@ -211,7 +211,7 @@ func (p *Packer) SubmitFrame(path Path, nf protocol.Frame) error {
 	p.logger.Debug("submit packet", "path", pid, "frames", len(assembled), "seq", nextPacketSeq, "size", len(out), "quicStreamID", quicStreamID, "pending_count", pendingCount)
 
 	// TRACK: juste avant l'appel à WriteStream
-	fmt.Printf("TRACK PacketBuild: pathID=%d, seq=%d, size=%d, quicStreamID=%d, first_bytes=% x\n", pid, nextPacketSeq, len(out), quicStreamID, out[:min(8, len(out))])
+	// fmt.Printf("TRACK PacketBuild: pathID=%d, seq=%d, size=%d, quicStreamID=%d, first_bytes=% x\n", pid, nextPacketSeq, len(out), quicStreamID, out[:min(8, len(out))])
 	start := time.Now()
 	// p.logger.Debug("WriteStream (SubmitFrame)", "path", pid, "seq", seq, "quicStreamID", quicStreamID, "bytes", len(out), "first_bytes", fmt.Sprintf("% x", out[:min(8, len(out))]))
 	_, err = path.WriteStream(quicStreamID, out)
@@ -665,7 +665,7 @@ func (p *Packer) SubmitFromSendStream(path Path, streamID protocol.StreamID) err
 	pid := path.PathID()
 
 	p.logger.Debug("SubmitFromSendStream enter", "path", pid, "stream", streamID)
-	fmt.Printf("TRACK SubmitFromSendStream: pathID=%d, streamID=%d\n", pid, streamID)
+	// fmt.Printf("TRACK SubmitFromSendStream: pathID=%d, streamID=%d\n", pid, streamID)
 	// Retrieve the provider via session's stream manager
 	session := path.Session()
 	if session == nil {
@@ -690,11 +690,11 @@ func (p *Packer) SubmitFromSendStream(path Path, streamID protocol.StreamID) err
 	frames := provider.PopFrames(maxBytes)
 	if len(frames) == 0 {
 		p.logger.Debug("no frames returned from provider", "stream", streamID)
-		fmt.Printf("TRACK SubmitFromSendStream: no frames from provider streamID=%d\n", streamID)
+		// fmt.Printf("TRACK SubmitFromSendStream: no frames from provider streamID=%d\n", streamID)
 		return nil
 	}
 	// TRACK: juste après le test frames vide
-	fmt.Printf("TRACK SubmitFromSendStream: pathID=%d, streamID=%d, frames=%d\n", pid, streamID, len(frames))
+	// fmt.Printf("TRACK SubmitFromSendStream: pathID=%d, streamID=%d, frames=%d\n", pid, streamID, len(frames))
 
 	var pkt protocol.Packet
 	pkt.Payload = make([]protocol.Frame, 0, len(frames))
@@ -714,7 +714,7 @@ func (p *Packer) SubmitFromSendStream(path Path, streamID protocol.StreamID) err
 		size += encSize
 		frameInfos = append(frameInfos, frameMetadata{streamID: protocol.StreamID(sf.StreamID), offset: sf.Offset, size: len(sf.Data)})
 		if sf.Type() == protocol.FrameTypeStream {
-			fmt.Printf("TRACK SubmitFromSendStream Included Frame: %v pathID=%d\n", sf.String(), pid)
+			// fmt.Printf("TRACK SubmitFromSendStream Included Frame: %v pathID=%d\n", sf.String(), pid)
 		}
 	}
 
@@ -732,7 +732,7 @@ func (p *Packer) SubmitFromSendStream(path Path, streamID protocol.StreamID) err
 	pkt.Header.PacketNum = seq
 
 	// build packet body
-	fmt.Printf("TRACK SubmitFromSendStream Assembled Packet: id=%d pathID=%d, streamID=%d, frames=%d\n", pkt.Header.PacketNum, pid, streamID, len(pkt.Payload))
+	// fmt.Printf("TRACK SubmitFromSendStream Assembled Packet: id=%d pathID=%d, streamID=%d, frames=%d\n", pkt.Header.PacketNum, pid, streamID, len(pkt.Payload))
 	packetBody, err := pkt.Serialize()
 	if err != nil {
 		p.logger.Error("failed to build packet payload from send stream", "err", err)
@@ -772,7 +772,7 @@ func (p *Packer) SubmitFromSendStream(path Path, streamID protocol.StreamID) err
 	p.mu.Unlock()
 
 	// TRACK: juste avant l'appel à WriteStream
-	fmt.Printf("TRACK PacketBuild: pathID=%d, seq=%d, size=%d, carrier=%d, first_bytes=% x\n", pid, seq, len(out), carrier, out[:min(8, len(out))])
+	// fmt.Printf("TRACK PacketBuild: pathID=%d, seq=%d, size=%d, carrier=%d, first_bytes=% x\n", pid, seq, len(out), carrier, out[:min(8, len(out))])
 	p.logger.Debug("WriteStream (sendBufferedStream)", "path", pid, "seq", seq, "carrier", carrier, "bytes", len(out), "first_bytes", fmt.Sprintf("% x", out[:min(8, len(out))]))
 	_, err = path.WriteStream(carrier, out)
 	if err != nil {

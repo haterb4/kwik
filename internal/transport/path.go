@@ -740,13 +740,13 @@ func (p *path) HandleControlFrame(nf protocol.Frame) error {
 			p.logger.Debug("ignoring AddPath frame on server-side path", "path", p.id)
 			return nil
 		}
-		fmt.Printf("TRACK CLIENT received AddPath frame - processing pathID=%d\n", p.id)
+		// fmt.Printf("TRACK CLIENT received AddPath frame - processing pathID=%d\n", p.id)
 		apf, ok := nf.(*protocol.AddPathFrame)
 		if !ok {
 			return nil
 		}
 		p.logger.Debug("received AddPath request", "address", apf.Address)
-		fmt.Printf("TRACK AddPath request: address=%s\n", apf.Address)
+		// fmt.Printf("TRACK AddPath request: address=%s\n", apf.Address)
 		pathID, err := p.session.PathManager().OpenPath(context.Background(), apf.Address, p.session)
 		if err != nil {
 			p.logger.Error("failed to open path", "error", err)
@@ -754,7 +754,7 @@ func (p *path) HandleControlFrame(nf protocol.Frame) error {
 		}
 		respFrame := &protocol.AddPathRespFrame{Address: apf.Address, PathID: pathID}
 		p.logger.Debug("sending AddPathResp", "address", apf.Address, "pathID", pathID)
-		fmt.Printf("TRACK AddPathResp: address=%s pathID=%d\n", apf.Address, pathID)
+		// fmt.Printf("TRACK AddPathResp: address=%s pathID=%d\n", apf.Address, pathID)
 		if si, ok := p.session.(sessionInternal); ok {
 			packer := si.Packer()
 			if packer != nil {

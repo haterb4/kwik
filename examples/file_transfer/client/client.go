@@ -6,10 +6,12 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/s-anzie/kwik"
 )
@@ -81,11 +83,34 @@ func main() {
 	// Canal pour compter les chunks reçus par fenêtre
 	chunksInWindowChan := make(chan int, totalChunks)
 
+	// Canal pour signaler l'arrêt de la goroutine de lecture
+	stopReading := make(chan bool, 1)
+
 	// Goroutine pour lire les chunks d'un flux donné.
 	// Cette fonction lit les messages applicatifs (index + taille + données) de manière robuste.
 	readChunks := func(s kwik.Stream) {
 		defer wg.Done()
+		defer log.Println("ReadChunks goroutine exiting")
+
 		for {
+			// Vérifier si on doit s'arrêter
+			select {
+			case <-stopReading:
+				log.Println("Stop signal received, exiting reader")
+				return
+			default:
+			}
+
+			// Vérifier si on a reçu tous les chunks attendus
+			mu.Lock()
+			chunksReceived := len(chunks)
+			mu.Unlock()
+
+			if chunksReceived >= int(totalChunks) {
+				log.Printf("All %d chunks received (%d), stopping reader", totalChunks, chunksReceived)
+				break
+			}
+
 			// 1. Lire l'en-tête de taille fixe (12 octets) en une seule fois.
 			// C'est la manière la plus robuste de consommer depuis un flux réseau.
 			header := make([]byte, 12) // 8 octets pour l'index (uint64), 4 pour la taille (uint32)
@@ -138,6 +163,7 @@ func main() {
 	// de nouveau flux à accepter.
 
 	// Boucle principale pour la gestion des fenêtres et des ACKs
+
 	for w := 0; w < metadata.TotalWindows; w++ {
 		chunksToExpect := metadata.WindowSizeChunks
 		if w == metadata.TotalWindows-1 && metadata.LastWindowSizeChunks > 0 {
@@ -165,8 +191,37 @@ func main() {
 		}
 	}
 
+	// Signaler à la goroutine de lecture de s'arrêter (non-bloquant car elle peut déjà être finie)
+	log.Println("All windows processed, signaling stop to reader...")
+	select {
+	case stopReading <- true:
+		log.Println("Stop signal sent")
+	default:
+		log.Println("Stop signal not needed (reader already finished)")
+	}
 	close(chunksInWindowChan)
-	stream.Close() // Fermer le stream après avoir reçu tous les chunks
+	log.Println("Closing stream...")
+	fmt.Printf("TRACK stream.Close(): Starting stream close\n")
+
+	// Essayer de fermer le stream avec un timeout
+	done := make(chan error, 1)
+	go func() {
+		fmt.Printf("TRACK stream.Close(): Entering goroutine\n")
+		err := stream.Close()
+		fmt.Printf("TRACK stream.Close(): Returned from stream.Close() with err=%v\n", err)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("Stream close returned error: %v", err)
+		} else {
+			log.Println("Stream closed successfully")
+		}
+	case <-time.After(5 * time.Second):
+		log.Println("Stream close timed out after 5 seconds - continuing anyway")
+	}
 
 	// Attendre que la goroutine de lecture termine proprement
 	log.Println("Waiting for stream reader to finish...")
@@ -200,4 +255,32 @@ func main() {
 	if finalStat.Size() != metadata.FileSize {
 		log.Printf("WARNING: Final file size (%d) does not match expected size (%d)!", finalStat.Size(), metadata.FileSize)
 	}
+
+	// Fermer explicitement la session QUIC pour arrêter toutes les goroutines
+	log.Println("Closing QUIC session...")
+	fmt.Printf("TRACK session.CloseWithError(): Starting session close\n")
+
+	// Essayer de fermer la session avec un timeout pour voir si elle bloque
+	sessionDone := make(chan error, 1)
+	go func() {
+		fmt.Printf("TRACK session.CloseWithError(): Entering goroutine\n")
+		err := session.CloseWithError(0, "Transfer completed successfully")
+		fmt.Printf("TRACK session.CloseWithError(): Returned from session.CloseWithError() with err=%v\n", err)
+		sessionDone <- err
+	}()
+
+	select {
+	case err := <-sessionDone:
+		fmt.Printf("TRACK session.CloseWithError(): Completed successfully with err=%v\n", err)
+		if err != nil {
+			log.Printf("Session close returned error: %v", err)
+		} else {
+			log.Println("Session closed successfully")
+		}
+	case <-time.After(10 * time.Second):
+		fmt.Printf("TRACK session.CloseWithError(): Timed out after 10 seconds\n")
+		log.Println("Session close timed out after 10 seconds")
+	}
+
+	log.Println("Client finished successfully")
 }

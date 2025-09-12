@@ -22,6 +22,8 @@ type ClientSession struct {
 	logger      logger.Logger
 	packer      *transport.Packer
 	multiplexer *transport.Multiplexer
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // Ensure ClientSession implements .Session
@@ -42,6 +44,9 @@ func NewClientSession(address string, tls *tls.Config, cfg *config.Config) *Clie
 	mgr := transport.NewClientPathManager(tls, cfg)
 	packer := transport.NewPacker(1048576)
 
+	// Créer un context avec cancel pour la session
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// La retransmission sera gérée par le Path, pas à ce niveau
 
 	sess := &ClientSession{
@@ -50,6 +55,8 @@ func NewClientSession(address string, tls *tls.Config, cfg *config.Config) *Clie
 		pathMgr:    mgr,
 		logger:     logger.NewLogger(logger.LogLevelSilent).WithComponent("CLIENT_SESSION"),
 		packer:     packer,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 	sess.streamMgr = NewStreamManager(sess)
 	sess.multiplexer = transport.NewMultiplexer(packer, sess.streamMgr)
@@ -69,6 +76,10 @@ func (s *ClientSession) PathManager() transport.PathManager {
 }
 func (s *ClientSession) StreamManager() StreamManager {
 	return s.streamMgr
+}
+
+func (s *ClientSession) Context() context.Context {
+	return s.ctx
 }
 
 /*
@@ -328,6 +339,11 @@ func (s *ClientSession) CloseWithError(code int, msg string) error {
 
 	// Log close reason for debugging (who/why closed the session)
 	s.logger.Info("CloseWithError called (client)", "code", code, "msg", msg, "local", s.localAddr, "remote", s.remoteAddr)
+
+	// Annuler le context pour signaler la fermeture
+	if s.cancel != nil {
+		s.cancel()
+	}
 
 	s.streamMgr.CloseAllStreams()
 
