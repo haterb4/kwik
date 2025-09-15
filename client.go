@@ -34,7 +34,7 @@ func DialAddr(ctx context.Context, address string, tls *tls.Config, cfg *config.
 	sess := NewClientSession(address, tls, cfg)
 	err := sess.connect(ctx)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	sess.localAddr = sess.pathMgr.GetPrimaryPath().LocalAddr()
 	return sess, nil
@@ -65,6 +65,10 @@ func NewClientSession(address string, tls *tls.Config, cfg *config.Config) *Clie
 
 func (s *ClientSession) Packer() *transport.Packer {
 	return s.packer
+}
+
+func (s *ClientSession) IsClient() bool {
+	return true
 }
 
 func (s *ClientSession) Multiplexer() *transport.Multiplexer {
@@ -158,7 +162,7 @@ func (s *ClientSession) AcceptStream(ctx context.Context) (Stream, error) {
 	// Add the path to the stream (this will also register with packer)
 	if err := s.streamMgr.AddPathToStream(stream.StreamID(), path); err != nil {
 		s.mu.Unlock()
-		s.streamMgr.RemoveStream(stream.StreamID()) // Clean up if path addition fails
+		_ = s.streamMgr.CloseStream(stream.StreamID()) // Clean up if path addition fails
 		path.RemoveStream(stream.StreamID())
 		s.logger.Error("Failed to add path to stream",
 			"streamID", stream.StreamID(),
@@ -200,7 +204,7 @@ func (s *ClientSession) OpenStreamSync(ctx context.Context) (Stream, error) {
 	// Add the path to the stream (this will also register with packer)
 	if err := s.streamMgr.AddPathToStream(stream.StreamID(), path); err != nil {
 		s.mu.Unlock()
-		s.streamMgr.RemoveStream(stream.StreamID()) // Clean up if path addition fails
+		_ = s.streamMgr.CloseStream(stream.StreamID()) // Clean up if path addition fails
 		path.RemoveStream(stream.StreamID())
 		s.logger.Error("Failed to add path to stream",
 			"streamID", stream.StreamID(),
@@ -250,7 +254,7 @@ func (s *ClientSession) OpenStream() (Stream, error) {
 	// Now open the stream on the path
 	if err := path.OpenStream(streamID); err != nil {
 		s.mu.Unlock()
-		s.streamMgr.RemoveStream(streamID) // Clean up if stream opening fails
+		_ = s.streamMgr.CloseStream(streamID) // Clean up if stream opening fails
 		s.logger.Error("Failed to open stream on path",
 			"streamID", streamID,
 			"pathID", path.PathID(),
@@ -261,7 +265,7 @@ func (s *ClientSession) OpenStream() (Stream, error) {
 	// Add the path to the stream (this will also register with packer)
 	if err := stream.AddPath(path); err != nil {
 		s.mu.Unlock()
-		s.streamMgr.RemoveStream(streamID) // Clean up if path addition fails
+		_ = s.streamMgr.CloseStream(streamID) // Clean up if path addition fails
 		s.logger.Error("Failed to add path to stream",
 			"streamID", streamID,
 			"pathID", path.PathID(),
@@ -298,48 +302,12 @@ func (s *ClientSession) SendRawData(data []byte, pathID protocol.PathID, streamI
 	return nil
 }
 
-// NotifyPathClosed informs all streams that a path has been closed
-// This method is called by path.Close() to notify the client session
-// that a path is being closed, so the streams using that path can be updated.
-func (s *ClientSession) NotifyPathClosed(pathID protocol.PathID, streamIDs []protocol.StreamID) {
-	s.logger.Debug("Notifying streams that path was closed", "pathID", pathID, "streamCount", len(streamIDs))
-
-	// Exclude control stream (ID 0) from notifications
-	var appStreamIDs []protocol.StreamID
-	for _, sid := range streamIDs {
-		if sid != 0 { // Skip control stream
-			appStreamIDs = append(appStreamIDs, sid)
-		}
-	}
-
-	if len(appStreamIDs) == 0 {
-		s.logger.Debug("No application streams to notify about path closure", "pathID", pathID)
-		return
-	}
-
-	// Get the stream manager implementation to access GetStream method
-
-	for _, sid := range appStreamIDs {
-		// Get the stream and remove the path
-		stream, exists := s.streamMgr.GetStream(sid)
-		if !exists {
-			s.logger.Debug("Stream not found when notifying of path closure", "streamID", sid, "pathID", pathID)
-			continue
-		}
-
-		// Remove the path from the stream
-		stream.RemovePath(pathID)
-		s.logger.Debug("Notified stream of path closure", "streamID", sid, "pathID", pathID)
-	}
-}
-
 func (s *ClientSession) CloseWithError(code int, msg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	// Log close reason for debugging (who/why closed the session)
 	s.logger.Info("CloseWithError called (client)", "code", code, "msg", msg, "local", s.localAddr, "remote", s.remoteAddr)
-
 	// Annuler le context pour signaler la fermeture
 	if s.cancel != nil {
 		s.cancel()
@@ -347,8 +315,12 @@ func (s *ClientSession) CloseWithError(code int, msg string) error {
 
 	s.streamMgr.CloseAllStreams()
 
-	if pm, ok := s.pathMgr.(interface{ CloseAllPaths() }); ok {
-		pm.CloseAllPaths()
+	if pm, ok := s.pathMgr.(interface{ CloseAllPaths() error }); ok {
+		err := pm.CloseAllPaths()
+		if err != nil {
+			s.logger.Error("Failed to close all paths", "error", err)
+			return err
+		}
 	}
 
 	// Stop multiplexer and packer background goroutines
@@ -358,6 +330,5 @@ func (s *ClientSession) CloseWithError(code int, msg string) error {
 	if s.packer != nil {
 		s.packer.Close()
 	}
-
 	return nil
 }

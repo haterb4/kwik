@@ -209,16 +209,25 @@ func main() {
 // runScenario exécute un scénario de test spécifique
 func (br *BenchmarkRunner) runScenario(config BenchmarkConfig, tlsConfig *tls.Config) (*BenchmarkResult, error) {
 	// Démarrage du serveur
-	listener, err := kwik.ListenAddr("localhost:0", tlsConfig, &quic.Config{
+	listener, err := kwik.ListenAddr("localhost:4435", tlsConfig, &quic.Config{
 		MaxIdleTimeout:  30 * time.Second,
 		KeepAlivePeriod: 15 * time.Second,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("erreur création listener: %w", err)
 	}
-	defer listener.Close()
+	defer func() {
+		fmt.Printf("TRACK BENCHMARK: Closing listener for scenario %s\n", config.Name)
+		err := listener.Close()
+		if err != nil {
+			fmt.Printf("TRACK BENCHMARK: Error closing listener: %v\n", err)
+		}
+		// Wait a bit more for proper cleanup between scenarios
+		fmt.Printf("TRACK BENCHMARK: Listener closed for scenario %s\n", config.Name)
+	}()
 
 	serverAddr := listener.Addr()
+	fmt.Printf("TRACK BENCHMARK: Using server address: %s\n", serverAddr)
 
 	// Goroutine serveur
 	go br.runServer(listener)
@@ -260,12 +269,13 @@ func (br *BenchmarkRunner) runScenario(config BenchmarkConfig, tlsConfig *tls.Co
 
 // runServer gère le serveur QUIC
 func (br *BenchmarkRunner) runServer(listener kwik.Listener) {
+	fmt.Printf("TRACK BENCHMARK: Server listening on %s\n", listener.Addr())
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
 			return
 		}
-
+		fmt.Printf("TRACK BENCHMARK: Accepted connection from %s\n", conn.RemoteAddr())
 		go br.handleConnection(conn)
 	}
 }

@@ -119,18 +119,28 @@ func (pm *pathManagerImpl) RemovePath(id protocol.PathID) {
 	delete(pm.paths, id)
 }
 
-func (pm *pathManagerImpl) CloseAllPaths() {
+func (pm *pathManagerImpl) CloseAllPaths() error {
 	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	pathCount := len(pm.paths)
+
 	// Close each path and remove it from the map to avoid stale references.
 	for id, path := range pm.paths {
 		if path != nil {
 			if err := path.Close(); err != nil {
-				pm.logger.Debug("error closing path", "pathID", id, "err", err)
+				return err
+			} else {
+				delete(pm.paths, id)
+				pm.logger.Debug("closed path", "pathID", id)
 			}
+		} else {
+			return fmt.Errorf("path %d is nil", id)
 		}
-		delete(pm.paths, id)
+
 	}
-	pm.mu.Unlock()
+	pm.logger.Info("Closed all paths", "count", pathCount)
+	return nil
 }
 
 func (pm *pathManagerImpl) AddRelay(address string) (Relay, error) {

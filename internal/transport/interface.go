@@ -32,7 +32,7 @@ type StreamManager interface {
 	CreateStream() Stream
 	GetStream(streamID protocol.StreamID) (Stream, bool)
 	AddPathToStream(streamID protocol.StreamID, path Path) error
-	RemoveStream(streamID protocol.StreamID)
+	CloseStream(streamID protocol.StreamID) error
 	// GetStreamFrameHandler returns an optional handler that can accept direct StreamFrame delivery
 	GetStreamFrameHandler(streamID protocol.StreamID) (StreamFrameHandler, bool)
 	// GetSendStreamProvider returns an optional provider that can supply frames for sending
@@ -90,6 +90,9 @@ type Session interface {
 	// Path manager access (internal use)
 	PathManager() PathManager
 	StreamManager() StreamManager
+
+	// Session purpose for client/server distinction
+	IsClient() bool
 }
 
 type Path interface {
@@ -144,5 +147,5 @@ type PathManager interface {
 	GetPrimaryPath() Path
 	GetPath(id protocol.PathID) Path
 	RemovePath(id protocol.PathID)
-	CloseAllPaths()
+	CloseAllPaths() error
 }

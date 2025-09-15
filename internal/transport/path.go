@@ -26,6 +26,7 @@ type path struct {
 	streams map[protocol.StreamID]*pathStream
 	mu      sync.Mutex
 	logger  logger.Logger
+	closed  bool // Explicit closed flag
 	// Global sequence counter for this path (since we use single QUIC stream)
 	globalWriteSeq uint64 // Atomic counter for packet sequence numbers
 	// Single QUIC stream for ALL traffic (control + data)
@@ -507,12 +508,12 @@ func (p *path) startClientHandshake() error {
 	}
 	// ensure handshake channel exists (carries Frame HandshakeRespFrame)
 	if p.handshakeRespCh == nil {
-		p.handshakeRespCh = make(chan protocol.Frame, 1)
+		p.handshakeRespCh = make(chan protocol.Frame, 10) // Increased buffer for high concurrency
 	}
 	p.sessionMu.Unlock()
 
-	const maxAttempts = 4
-	backoffMs := 200
+	const maxAttempts = 6 // More attempts for busy servers
+	backoffMs := 100      // Faster initial timeout
 	// generate expected nonce
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
@@ -526,17 +527,26 @@ func (p *path) startClientHandshake() error {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		h := &protocol.HandshakeFrame{}
 		p.logger.Debug("start handshake attempt", "path", p.id, "isClient", p.isClient, "attempt", attempt)
+		fmt.Printf("TRACK HANDSHAKE: Path %d client attempt %d/%d\n", p.id, attempt, maxAttempts)
 		if si, ok := p.session.(sessionInternal); ok {
 			packer := si.Packer()
 			if packer != nil {
+				fmt.Printf("TRACK HANDSHAKE: Path %d submitting handshake frame via packer\n", p.id)
 				_ = packer.SubmitFrame(p, h)
+			} else {
+				fmt.Printf("TRACK HANDSHAKE: Path %d no packer available\n", p.id)
 			}
+		} else {
+			fmt.Printf("TRACK HANDSHAKE: Path %d no session internal interface\n", p.id)
 		}
 
 		// wait for response with timeout
+		fmt.Printf("TRACK HANDSHAKE: Path %d waiting for response (timeout=%dms)\n", p.id, backoffMs)
 		select {
 		case resp := <-p.handshakeRespCh:
+			fmt.Printf("TRACK HANDSHAKE: Path %d received response\n", p.id)
 			if resp != nil && resp.Type() == protocol.FrameTypeHandshake {
+				fmt.Printf("TRACK HANDSHAKE: Path %d handshake successful!\n", p.id)
 				p.sessionMu.Lock()
 				p.sessionReady = true
 				p.expectedHandshakeNonce = nil
@@ -544,8 +554,11 @@ func (p *path) startClientHandshake() error {
 				go p.startHealthLoop()
 				p.logger.Info("handshake completed", "path", p.id)
 				return nil
+			} else {
+				fmt.Printf("TRACK HANDSHAKE: Path %d received invalid response (type=%v)\n", p.id, resp)
 			}
 		case <-time.After(time.Duration(backoffMs) * time.Millisecond):
+			fmt.Printf("TRACK HANDSHAKE: Path %d timeout on attempt %d\n", p.id, attempt)
 			p.logger.Debug("handshake timeout, will retry", "path", p.id, "attempt", attempt)
 		}
 
@@ -706,6 +719,7 @@ func (p *path) HandleControlFrame(nf protocol.Frame) error {
 		atomic.StoreInt32(&p.healthy, 1)
 		return nil
 	case protocol.FrameTypeHandshake:
+		fmt.Printf("TRACK HANDSHAKE: Path %d received handshake frame (isClient=%v)\n", p.id, p.isClient)
 		p.logger.Debug("received handshake frame", "path", p.id, "isClient", p.isClient)
 		if p.isClient {
 			p.sessionMu.Lock()
@@ -722,11 +736,17 @@ func (p *path) HandleControlFrame(nf protocol.Frame) error {
 			}
 			return nil
 		} else {
+			fmt.Printf("TRACK HANDSHAKE: Path %d server responding to handshake\n", p.id)
 			if si, ok := p.session.(sessionInternal); ok {
 				packer := si.Packer()
 				if packer != nil {
+					fmt.Printf("TRACK HANDSHAKE: Path %d submitting handshake response\n", p.id)
 					_ = packer.SubmitFrame(p, &protocol.HandshakeFrame{})
+				} else {
+					fmt.Printf("TRACK HANDSHAKE: Path %d no packer for response\n", p.id)
 				}
+			} else {
+				fmt.Printf("TRACK HANDSHAKE: Path %d no session internal for response\n", p.id)
 			}
 			p.sessionMu.Lock()
 			p.sessionReady = true
@@ -1015,8 +1035,15 @@ func (p *path) Close() error {
 	p.logger.Info("Path Close called", "path", p.id, "local", p.LocalAddr(), "remote", p.RemoteAddr())
 
 	p.mu.Lock()
-	// Idempotence: si déjà fermé (streams vide)
-	alreadyClosed := len(p.streams) == 0
+	// Idempotence: si déjà fermé
+	if p.closed {
+		p.mu.Unlock()
+		p.logger.Debug("path already closed", "path", p.id)
+		return nil
+	}
+
+	// Mark as closed immediately to prevent re-entry
+	p.closed = true
 	// Collecter les streamIDs pour nettoyer les buffers de réception
 	var streamIDs []protocol.StreamID
 	for sid := range p.streams {
@@ -1024,11 +1051,6 @@ func (p *path) Close() error {
 		delete(p.streams, sid)
 	}
 	p.mu.Unlock()
-
-	if alreadyClosed {
-		p.logger.Debug("path already closed", "path", p.id)
-		return nil
-	}
 
 	// Nettoyer tous les buffers de réception pour éviter les fuites mémoire
 	for _, streamID := range streamIDs {
@@ -1038,6 +1060,7 @@ func (p *path) Close() error {
 
 	// Close acceptStreamWaiters to prevent goroutine leaks and signal waiting operations
 	p.acceptStreamWaitersMu.Lock()
+
 	for streamID, ch := range p.acceptStreamWaiters {
 		select {
 		case <-ch:
@@ -1051,6 +1074,7 @@ func (p *path) Close() error {
 
 	// Close openStreamRespCh to prevent goroutine leaks
 	p.openStreamRespChMu.Lock()
+
 	for streamID := range p.openStreamRespCh {
 		delete(p.openStreamRespCh, streamID)
 	}
@@ -1059,8 +1083,12 @@ func (p *path) Close() error {
 	// Close unified stream
 	p.transportStreamMu.Lock()
 	if p.transportStream != nil {
+
 		if err := p.transportStream.Close(); err != nil {
 			p.logger.Debug("error closing unified stream", "path", p.id, "err", err)
+			return err
+		} else {
+			p.logger.Debug("Transport stream closed successfully", "path", p.id)
 		}
 		p.transportStream = nil
 	}

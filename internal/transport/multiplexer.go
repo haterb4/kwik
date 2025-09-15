@@ -95,6 +95,10 @@ type Multiplexer struct {
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 
+	// Shutdown coordination
+	closed   bool
+	closedMu sync.RWMutex
+
 	// Métriques
 	metricsMu    sync.Mutex
 	ackSentCount int64
@@ -130,6 +134,14 @@ func (m *Multiplexer) SetNotifier(notifier StreamNotifier) {
 }
 
 func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
+	// Check if multiplexer is closed first
+	m.closedMu.RLock()
+	if m.closed {
+		m.closedMu.RUnlock()
+		return fmt.Errorf("multiplexer is closed")
+	}
+	m.closedMu.RUnlock()
+
 	if len(pkt) == 0 {
 		return nil
 	}
@@ -154,8 +166,11 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 			streamID := protocol.StreamID(f.StreamID)
 			// Record last seen path/packet for this stream
 			m.mu.Lock()
-			m.lastSeenPathForStream[streamID] = pathID
-			m.lastSeenPacketSeqForStream[streamID] = parsed.Header.PacketNum
+			// Check if maps are still valid after getting lock
+			if m.lastSeenPathForStream != nil && m.lastSeenPacketSeqForStream != nil {
+				m.lastSeenPathForStream[streamID] = pathID
+				m.lastSeenPacketSeqForStream[streamID] = parsed.Header.PacketNum
+			}
 			m.mu.Unlock()
 
 			// Log whether this is from primary or relay path
@@ -179,11 +194,13 @@ func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
 
 			// fmt.Printf("TRACK StreamFrame: Adding to buffer streamID=%d pathID=%d offset=%d\n", streamID, pathID, f.Offset)
 			receptionBuffer := m.getOrCreateReceptionBuffer(streamID)
-			receptionBuffer.PushStreamFrame(f)
-			if m.notifier != nil {
-				m.notifier.NotifyDataAvailable(streamID)
+			if receptionBuffer != nil {
+				receptionBuffer.PushStreamFrame(f)
+				if m.notifier != nil {
+					m.notifier.NotifyDataAvailable(streamID)
+				}
+				m.logger.Debug("Frame added to reception buffer and notifier called", "streamID", streamID, "offset", f.Offset, "size", len(f.Data))
 			}
-			m.logger.Debug("Frame added to reception buffer and notifier called", "streamID", streamID, "offset", f.Offset, "size", len(f.Data))
 		default:
 			// Control frames (Handshake, Ping, AddPath, RelayData, etc.)
 			// fmt.Printf("TRACK PushPacket: Received Control frame: %v\n", fr)
@@ -221,6 +238,11 @@ func (m *Multiplexer) getOrCreateReceptionBuffer(streamID protocol.StreamID) *Re
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Check if reception buffers map is still valid
+	if m.receptionBuffers == nil {
+		return nil
+	}
+
 	buffer, exists := m.receptionBuffers[streamID]
 	if !exists {
 		buffer = NewReceptionBuffer(streamID)
@@ -245,8 +267,22 @@ func (m *Multiplexer) PopFramesForStream(streamID protocol.StreamID) []*protocol
 
 // recordReceivedPacket enregistre la réception d'un paquet pour un chemin donné
 func (m *Multiplexer) recordReceivedPacket(pathID protocol.PathID, packetSeq uint64) {
+	// Check if multiplexer is closed first
+	m.closedMu.RLock()
+	if m.closed {
+		m.closedMu.RUnlock()
+		return
+	}
+	m.closedMu.RUnlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Double-check after acquiring lock that maps are still valid
+	if m.received == nil {
+		return
+	}
+
 	if _, ok := m.received[pathID]; !ok {
 		m.received[pathID] = make(map[uint64]struct{})
 	}
@@ -259,6 +295,14 @@ func (m *Multiplexer) recordReceivedPacket(pathID protocol.PathID, packetSeq uin
 
 // sendAckNow envoie immédiatement un ACK pour un chemin donné
 func (m *Multiplexer) sendAckNow(pid protocol.PathID) {
+	// Check if multiplexer is closed first
+	m.closedMu.RLock()
+	if m.closed {
+		m.closedMu.RUnlock()
+		return
+	}
+	m.closedMu.RUnlock()
+
 	ranges := m.GetAckRanges(pid)
 	if len(ranges) == 0 {
 		m.logger.Debug("No ACK ranges to send", "path", pid)
@@ -305,17 +349,20 @@ func (m *Multiplexer) sendAckNow(pid protocol.PathID) {
 
 		// Cleanup acknowledged packets
 		m.mu.Lock()
-		if mp, ok := m.received[pid]; ok {
-			for _, r := range ranges {
-				for i := r.Smallest; i <= r.Largest; i++ {
-					delete(mp, i)
+		// Check if maps are still valid after cleanup
+		if m.received != nil {
+			if mp, ok := m.received[pid]; ok {
+				for _, r := range ranges {
+					for i := r.Smallest; i <= r.Largest; i++ {
+						delete(mp, i)
+					}
 				}
-			}
-			if len(mp) == 0 {
-				delete(m.received, pid)
-				m.logger.Debug("Cleared all ACKed packets for path", "path", pid)
-			} else {
-				m.logger.Debug("Remaining unACKed packets after cleanup", "path", pid, "count", len(mp))
+				if len(mp) == 0 {
+					delete(m.received, pid)
+					m.logger.Debug("Cleared all ACKed packets for path", "path", pid)
+				} else {
+					m.logger.Debug("Remaining unACKed packets after cleanup", "path", pid, "count", len(mp))
+				}
 			}
 		}
 		m.mu.Unlock()
@@ -327,16 +374,21 @@ func (m *Multiplexer) sendAckNow(pid protocol.PathID) {
 // GetAckRanges convertit les numéros de séquence reçus en plages compactes pour un ACK
 func (m *Multiplexer) GetAckRanges(pathID protocol.PathID) []protocol.AckRange {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	// Check if received map is still valid
+	if m.received == nil {
+		return nil
+	}
+
 	mp, ok := m.received[pathID]
 	if !ok || len(mp) == 0 {
-		m.mu.RUnlock()
 		return nil
 	}
 	seqs := make([]uint64, 0, len(mp))
 	for s := range mp {
 		seqs = append(seqs, s)
 	}
-	m.mu.RUnlock()
 
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 
@@ -377,6 +429,11 @@ func (m *Multiplexer) StartAckLoop(intervalMs int) {
 			loopCount++
 
 			m.mu.RLock()
+			// Check if maps are still valid before accessing
+			if m.received == nil {
+				m.mu.RUnlock()
+				continue
+			}
 			paths := make([]protocol.PathID, 0, len(m.received))
 			for pid := range m.received {
 				paths = append(paths, pid)
@@ -392,6 +449,16 @@ func (m *Multiplexer) StartAckLoop(intervalMs int) {
 
 // Close stops the ack loop and clears reception buffers. Safe to call multiple times.
 func (m *Multiplexer) Close() {
+	m.closedMu.Lock()
+	if m.closed {
+		m.closedMu.Unlock()
+		return
+	}
+	m.closed = true
+	m.closedMu.Unlock()
+
+	m.logger.Info("Closing multiplexer")
+
 	m.mu.Lock()
 	if m.stopCh == nil {
 		m.mu.Unlock()
@@ -405,7 +472,19 @@ func (m *Multiplexer) Close() {
 	}
 	m.mu.Unlock()
 
-	m.wg.Wait()
+	// Add timeout to avoid infinite blocking
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		m.logger.Info("Multiplexer goroutines stopped successfully")
+	case <-time.After(2 * time.Second):
+		m.logger.Warn("Timeout waiting for multiplexer goroutines to stop")
+	}
 
 	// Release maps to allow GC
 	m.mu.Lock()
@@ -414,12 +493,28 @@ func (m *Multiplexer) Close() {
 	m.lastSeenPathForStream = nil
 	m.lastSeenPacketSeqForStream = nil
 	m.mu.Unlock()
+
+	m.logger.Info("Multiplexer closed successfully")
 }
 
 // CleanupStreamBuffer nettoie le buffer d'un stream fermé
 func (m *Multiplexer) CleanupStreamBuffer(streamID protocol.StreamID) {
+	m.closedMu.RLock()
+	if m.closed {
+		m.closedMu.RUnlock()
+		return
+	}
+	m.closedMu.RUnlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.receptionBuffers, streamID)
 	m.logger.Debug("Cleaned up reception buffer", "streamID", streamID)
+}
+
+// IsClosed returns true if the multiplexer has been closed
+func (m *Multiplexer) IsClosed() bool {
+	m.closedMu.RLock()
+	defer m.closedMu.RUnlock()
+	return m.closed
 }

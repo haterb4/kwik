@@ -233,7 +233,7 @@ type StreamImpl struct {
 	primaryPathID  protocol.PathID
 	writeOffset    uint64
 	logger         logger.Logger
-	streamManager  *streamManagerImpl
+	streamManager  StreamManager
 	// QUIC-like send/recv streams
 	recv *RecvStream
 	send *SendStream
@@ -242,7 +242,7 @@ type StreamImpl struct {
 // Ensure StreamImpl implements Stream
 var _ Stream = (*StreamImpl)(nil)
 
-func NewStream(id protocol.StreamID, sm *streamManagerImpl) *StreamImpl {
+func NewStream(id protocol.StreamID, sm StreamManager) *StreamImpl {
 	s := &StreamImpl{
 		id:            id,
 		logger:        logger.NewLogger(logger.LogLevelSilent).WithComponent("STREAM_IMPL"),
@@ -361,22 +361,11 @@ func (s *StreamImpl) Write(p []byte) (int, error) {
 
 // Close ferme le stream
 func (s *StreamImpl) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var lastErr error
-	for _, path := range s.paths {
-		if err := path.CloseStream(s.id); err != nil {
-			s.logger.Error("failed to close stream on path", "streamID", s.id, "pathID", path.PathID(), "error", err)
-			lastErr = err
-		}
-	}
-
 	if s.streamManager != nil {
-		s.streamManager.RemoveStream(s.id)
+		return s.streamManager.CloseStream(s.id)
 	}
-
-	return lastErr
+	fmt.Printf("TRACK CLOSE STREAM %d (no stream manager)\n", s.id)
+	return nil
 }
 
 // StreamID retourne l'ID du stream

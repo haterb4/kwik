@@ -1,6 +1,7 @@
 package kwik
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/s-anzie/kwik/internal/logger"
@@ -13,6 +14,7 @@ type streamManagerImpl struct {
 	streams      map[protocol.StreamID]*StreamImpl
 	nextStreamID protocol.StreamID
 	logger       logger.Logger
+	isClient     bool
 	session      Session
 }
 
@@ -21,6 +23,7 @@ func NewStreamManager(session Session) *streamManagerImpl {
 		streams:      make(map[protocol.StreamID]*StreamImpl),
 		nextStreamID: 1,
 		session:      session,
+		isClient:     session.IsClient(),
 		logger:       logger.NewLogger(logger.LogLevelSilent).WithComponent("STREAM_MANAGER"),
 	}
 }
@@ -137,14 +140,15 @@ func (m *streamManagerImpl) addStream(stream *StreamImpl) {
 	m.logger.Debug("Added stream", "streamID", stream.id)
 }
 
-func (m *streamManagerImpl) RemoveStream(streamID protocol.StreamID) {
+func (m *streamManagerImpl) CloseStream(streamID protocol.StreamID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if stream, exists := m.streams[streamID]; exists {
 		// Before removing the stream, cancel any pending packets and cleanup reception buffer
-		// Use the per-path helpers so we don't need to access session internals here.
-		// Copy the paths slice under the stream lock to avoid races.
+		if !m.isClient {
+			fmt.Printf("TRACK MGR CLOSE STREAM %d\n", streamID)
+		}
 		stream.mu.Lock()
 		paths := make([]transport.Path, 0, len(stream.paths))
 		for _, p := range stream.paths {
@@ -154,20 +158,55 @@ func (m *streamManagerImpl) RemoveStream(streamID protocol.StreamID) {
 
 		for _, p := range paths {
 			if p != nil {
-				p.CancelFramesForStream(streamID)
-				p.CleanupStreamBuffer(streamID)
+				err := p.CloseStream(streamID)
+				if err != nil {
+					m.logger.Error("Failed to close stream path",
+						"streamID", streamID,
+						"pathID", p.PathID(),
+						"error", err)
+					return err
+				}
 			}
 		}
 
 		delete(m.streams, streamID)
 		m.logger.Debug("Removed stream", "streamID", streamID)
+		if !m.isClient {
+			fmt.Printf("TRACK MGR STREAM: %d CLOSED\n", streamID)
+		}
+		return nil
 	}
+	if !m.isClient {
+		fmt.Printf("TRACK MGR CLOSE STREAM, STREAM: %d NOT FOUND\n", streamID)
+	}
+	return nil
 }
 
-func (mg *streamManagerImpl) CloseAllStreams() {
-	mg.mu.Lock()
-	defer mg.mu.Unlock()
-	for _, stream := range mg.streams {
-		stream.Close()
+func (m *streamManagerImpl) CloseAllStreams() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, stream := range m.streams {
+		// Before removing the stream, cancel any pending packets and cleanup reception buffer
+		stream.mu.Lock()
+		if !m.isClient {
+			fmt.Printf("TRACK MGR CLOSE ALL STREAM %d \n", stream.id)
+		}
+		paths := make([]transport.Path, 0, len(stream.paths))
+		for _, p := range stream.paths {
+			paths = append(paths, p)
+		}
+		stream.mu.Unlock()
+
+		for _, p := range paths {
+			if p != nil {
+				_ = p.CloseStream(stream.id)
+			}
+		}
+
+		delete(m.streams, stream.id)
+		m.logger.Debug("Removed stream", "streamID", stream.id)
+		if !m.isClient {
+			fmt.Printf("TRACK STREAM: %d CLOSED (all streams)\n", stream.id)
+		}
 	}
 }
