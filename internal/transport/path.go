@@ -2,7 +2,6 @@ package transport
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"runtime"
@@ -37,8 +36,6 @@ type path struct {
 	// handshake / session state
 	sessionMu    sync.Mutex
 	sessionReady bool
-	// handshakeRespCh now carries Frame values (HandshakeRespFrame) from HandleControlFrame
-	handshakeRespCh      chan protocol.Frame
 	lastAcceptedStreamID protocol.StreamID // tracks the last accepted stream ID
 	// health check
 	healthIntervalMs  int
@@ -50,7 +47,6 @@ type path struct {
 	lastPongAtUnixMilli    int64
 	healthy                int32 // atomic bool
 	missedPongThreshold    int
-	expectedHandshakeNonce []byte
 	// control stream creation guard
 	controlReady chan struct{}
 	session      Session
@@ -75,6 +71,7 @@ func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool, session Session
 		missedPongThreshold:  3,
 		lastAcceptedStreamID: 1,
 		session:              session,
+		sessionReady:         true, // Session is immediately ready without handshake
 	}
 	// Initialize control stream readiness channel
 	path.controlReady = make(chan struct{})
@@ -91,10 +88,8 @@ func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool, session Session
 		path.transportStream = stream
 		close(path.controlReady)
 		go path.runTransportStreamReader(stream)
-		err = path.startClientHandshake()
-		if err != nil {
-			panic(err)
-		}
+		// Start health monitoring immediately since session is ready
+		go path.startHealthLoop()
 	} else {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -105,10 +100,8 @@ func NewPath(id protocol.PathID, conn *quic.Conn, isClient bool, session Session
 		path.transportStream = stream
 		close(path.controlReady)
 		go path.runTransportStreamReader(stream)
-		err = path.startServerHandshake()
-		if err != nil {
-			panic(err)
-		}
+		// Start health monitoring immediately since session is ready
+		go path.startHealthLoop()
 	}
 	path.acceptStreamWaiters = make(map[protocol.StreamID]chan struct{})
 	return &path
@@ -465,108 +458,6 @@ func (p *path) runTransportStreamReader(s *quic.Stream) {
 // internal to the path implementation; higher-level code should call WriteStream
 // directly when possible.
 
-func (p *path) startServerHandshake() error {
-	p.sessionMu.Lock()
-	if p.sessionReady {
-		p.sessionMu.Unlock()
-		return nil
-	}
-	p.sessionMu.Unlock()
-
-	// Server waits for handshake from client
-	// The handshake will be processed in HandleControlFrame when received
-	// We just need to wait for the session to become ready
-	const maxWaitTime = 10 * time.Second
-	const checkInterval = 100 * time.Millisecond
-
-	start := time.Now()
-	for {
-		p.sessionMu.Lock()
-		ready := p.sessionReady
-		p.sessionMu.Unlock()
-
-		if ready {
-			p.logger.Info("server handshake completed", "path", p.id)
-			return nil
-		}
-
-		if time.Since(start) > maxWaitTime {
-			p.logger.Error("server handshake timeout", "path", p.id)
-			return protocol.NewHandshakeFailedError(p.id)
-		}
-
-		time.Sleep(checkInterval)
-	}
-}
-
-// StartHandshake performs a simple handshake exchange: send Handshake, wait for HandshakeResp.
-func (p *path) startClientHandshake() error {
-	p.sessionMu.Lock()
-	if p.sessionReady {
-		p.sessionMu.Unlock()
-		return nil
-	}
-	// ensure handshake channel exists (carries Frame HandshakeRespFrame)
-	if p.handshakeRespCh == nil {
-		p.handshakeRespCh = make(chan protocol.Frame, 10) // Increased buffer for high concurrency
-	}
-	p.sessionMu.Unlock()
-
-	const maxAttempts = 6 // More attempts for busy servers
-	backoffMs := 100      // Faster initial timeout
-	// generate expected nonce
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return protocol.NewHandshakeNonceError(p.id, err)
-	}
-	p.sessionMu.Lock()
-	p.expectedHandshakeNonce = make([]byte, len(nonce))
-	copy(p.expectedHandshakeNonce, nonce)
-	p.sessionMu.Unlock()
-
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		h := &protocol.HandshakeFrame{}
-		p.logger.Debug("start handshake attempt", "path", p.id, "isClient", p.isClient, "attempt", attempt)
-		fmt.Printf("TRACK HANDSHAKE: Path %d client attempt %d/%d\n", p.id, attempt, maxAttempts)
-		if si, ok := p.session.(sessionInternal); ok {
-			packer := si.Packer()
-			if packer != nil {
-				fmt.Printf("TRACK HANDSHAKE: Path %d submitting handshake frame via packer\n", p.id)
-				_ = packer.SubmitFrame(p, h)
-			} else {
-				fmt.Printf("TRACK HANDSHAKE: Path %d no packer available\n", p.id)
-			}
-		} else {
-			fmt.Printf("TRACK HANDSHAKE: Path %d no session internal interface\n", p.id)
-		}
-
-		// wait for response with timeout
-		fmt.Printf("TRACK HANDSHAKE: Path %d waiting for response (timeout=%dms)\n", p.id, backoffMs)
-		select {
-		case resp := <-p.handshakeRespCh:
-			fmt.Printf("TRACK HANDSHAKE: Path %d received response\n", p.id)
-			if resp != nil && resp.Type() == protocol.FrameTypeHandshake {
-				fmt.Printf("TRACK HANDSHAKE: Path %d handshake successful!\n", p.id)
-				p.sessionMu.Lock()
-				p.sessionReady = true
-				p.expectedHandshakeNonce = nil
-				p.sessionMu.Unlock()
-				go p.startHealthLoop()
-				p.logger.Info("handshake completed", "path", p.id)
-				return nil
-			} else {
-				fmt.Printf("TRACK HANDSHAKE: Path %d received invalid response (type=%v)\n", p.id, resp)
-			}
-		case <-time.After(time.Duration(backoffMs) * time.Millisecond):
-			fmt.Printf("TRACK HANDSHAKE: Path %d timeout on attempt %d\n", p.id, attempt)
-			p.logger.Debug("handshake timeout, will retry", "path", p.id, "attempt", attempt)
-		}
-
-		backoffMs *= 2
-	}
-	return protocol.NewHandshakeFailedError(p.id)
-}
-
 func (p *path) startHealthLoop() {
 	// Prevent multiple health loops
 	if !atomic.CompareAndSwapInt32(&p.healthLoopStarted, 0, 1) {
@@ -718,43 +609,6 @@ func (p *path) HandleControlFrame(nf protocol.Frame) error {
 		atomic.StoreInt64(&p.missedPongs, 0)
 		atomic.StoreInt32(&p.healthy, 1)
 		return nil
-	case protocol.FrameTypeHandshake:
-		fmt.Printf("TRACK HANDSHAKE: Path %d received handshake frame (isClient=%v)\n", p.id, p.isClient)
-		p.logger.Debug("received handshake frame", "path", p.id, "isClient", p.isClient)
-		if p.isClient {
-			p.sessionMu.Lock()
-			ready := p.sessionReady
-			ch := p.handshakeRespCh
-			p.sessionMu.Unlock()
-			if !ready && ch != nil {
-				select {
-				case ch <- nf:
-					p.logger.Debug("handshake response delivered to client handshake channel", "path", p.id)
-				default:
-					p.logger.Warn("handshakeRespCh full or not ready", "path", p.id)
-				}
-			}
-			return nil
-		} else {
-			fmt.Printf("TRACK HANDSHAKE: Path %d server responding to handshake\n", p.id)
-			if si, ok := p.session.(sessionInternal); ok {
-				packer := si.Packer()
-				if packer != nil {
-					fmt.Printf("TRACK HANDSHAKE: Path %d submitting handshake response\n", p.id)
-					_ = packer.SubmitFrame(p, &protocol.HandshakeFrame{})
-				} else {
-					fmt.Printf("TRACK HANDSHAKE: Path %d no packer for response\n", p.id)
-				}
-			} else {
-				fmt.Printf("TRACK HANDSHAKE: Path %d no session internal for response\n", p.id)
-			}
-			p.sessionMu.Lock()
-			p.sessionReady = true
-			p.sessionMu.Unlock()
-			p.logger.Info("handshake completed (server-side)", "path", p.id, "isClient", p.isClient)
-			go p.startHealthLoop()
-			return nil
-		}
 	case protocol.FrameTypeAddPath:
 		if !p.isClient {
 			p.logger.Debug("ignoring AddPath frame on server-side path", "path", p.id)

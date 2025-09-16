@@ -40,7 +40,6 @@ const (
 	FrameTypeAck    FrameType = 0x2
 	FrameTypeNack   FrameType = 0x3
 	// Control frames
-	FrameTypeHandshake FrameType = 0x4
 	FrameTypePing      FrameType = 0x5
 	// Path management frames
 	FrameTypeAddPath     FrameType = 0x6
@@ -202,15 +201,6 @@ func parseStreamFrame(r *bytes.Reader) (*StreamFrame, error) {
 }
 
 // Control frame types in the new model
-type HandshakeFrame struct{}
-
-func (f *HandshakeFrame) Type() FrameType { return FrameTypeHandshake }
-func (f *HandshakeFrame) String() string {
-	return "HandshakeFrame{}"
-}
-func (f *HandshakeFrame) Serialize() ([]byte, error) {
-	return []byte{byte(f.Type())}, nil
-}
 
 type PingFrame struct{}
 
@@ -456,9 +446,6 @@ func ParseFrame(data []byte) (Frame, error) {
 	case FrameTypePing:
 		// un Ping n'a pas de contenu
 		return &PingFrame{}, nil
-	case FrameTypeHandshake:
-		// un Handshake n'a pas de contenu
-		return &HandshakeFrame{}, nil
 	case FrameTypeAddPath:
 		return parseAddPathFrame(r)
 	case FrameTypeAddPathResp:

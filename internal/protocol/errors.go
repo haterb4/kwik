@@ -65,20 +65,10 @@ func NewNotExistStreamError(pathID PathID, streamID StreamID) error {
 	return NewKwikError(ErrDataStreamNotExists, fmt.Sprintf("stream %d not found on path: %d", streamID, pathID), nil)
 }
 
-// Handshake and control errors
+// Frame and control errors
 const (
-	ErrHandshakeFailed      = "KWIK_HANDSHAKE_FAILED"
-	ErrHandshakeNonceFailed = "KWIK_HANDSHAKE_NONCE_FAILED"
-	ErrFrameTooLarge        = "KWIK_FRAME_TOO_LARGE"
+	ErrFrameTooLarge = "KWIK_FRAME_TOO_LARGE"
 )
-
-func NewHandshakeFailedError(pathID PathID) error {
-	return NewKwikError(ErrHandshakeFailed, fmt.Sprintf("handshake failed on path %d", pathID), nil)
-}
-
-func NewHandshakeNonceError(pathID PathID, cause error) error {
-	return NewKwikError(ErrHandshakeNonceFailed, fmt.Sprintf("failed to generate or validate handshake nonce on path %d", pathID), cause)
-}
 
 func NewFrameTooLargeError(frameSize, maxSize int) error {
 	return NewKwikError(ErrFrameTooLarge, fmt.Sprintf("frame too large for maxPacketSize: %d > %d", frameSize, maxSize), nil)
