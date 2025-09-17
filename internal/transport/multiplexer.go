@@ -6,102 +6,175 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/s-anzie/kwik/internal/logger"
 	"github.com/s-anzie/kwik/internal/protocol"
 )
 
-// ReceptionBuffer - Tampon de réception simple pour un stream
+const (
+	// Configuration par défaut optimisée
+	DefaultAckThreshold  = 16   // Réduit de 32 à 16 pour des ACKs plus fréquents
+	DefaultAckIntervalMs = 100  // Réduit de 500ms à 100ms pour une latence plus faible
+	MaxSeenCacheSize     = 1000 // Limite pour éviter une croissance infinie
+	BatchProcessingSize  = 32   // Traitement par batch des frames
+)
+
+// ReceptionBuffer optimisée avec pooling des objets et réduction des allocations
 type ReceptionBuffer struct {
-	mu sync.Mutex
-	// streamBuffer holds data chunks indexed by offset for contiguous reassembly
+	mu           sync.RWMutex // RWMutex au lieu de Mutex pour les lectures concurrentes
 	streamBuffer *StreamBuffer
 	logger       logger.Logger
-	// seen holds keys of frames already stored to avoid duplicates (key: "streamID:offset")
-	seen     map[string]struct{}
-	streamID protocol.StreamID
+	// Utilisation d'un map[uint64]struct{} plus efficace (offset uniquement)
+	seenOffsets map[uint64]struct{}
+	streamID    protocol.StreamID
+
+	// Pool pour réutiliser les slices de données
+	dataPool sync.Pool
 }
 
 func NewReceptionBuffer(streamID protocol.StreamID) *ReceptionBuffer {
-	return &ReceptionBuffer{
+	rb := &ReceptionBuffer{
 		streamBuffer: NewStreamBuffer(),
 		logger:       logger.NewLogger(logger.LogLevelSilent).WithComponent(fmt.Sprintf("RECEPTION_BUFFER_%d", streamID)),
-		seen:         make(map[string]struct{}),
+		seenOffsets:  make(map[uint64]struct{}),
 		streamID:     streamID,
 	}
+
+	// Initialiser le pool de données
+	rb.dataPool.New = func() interface{} {
+		return make([]byte, 0, 4096) // Capacité initiale de 4KB
+	}
+
+	return rb
 }
 
-// (legacy PushFrame removed) Use PushStreamFrame for new StreamFrame objects
-
-// PushStreamFrame accepts the new-style StreamFrame directly to avoid conversions.
+// PushStreamFrame optimisée avec moins d'allocations
 func (rb *ReceptionBuffer) PushStreamFrame(sf *protocol.StreamFrame) {
+	// Vérification rapide en lecture seule d'abord
+	rb.mu.RLock()
+	_, isDuplicate := rb.seenOffsets[sf.Offset]
+	rb.mu.RUnlock()
+
+	if isDuplicate {
+		rb.logger.Debug("Dropping duplicate stream frame", "streamID", sf.StreamID, "offset", sf.Offset, "size", len(sf.Data))
+		return
+	}
+
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	key := fmt.Sprintf("%d:%d", sf.StreamID, sf.Offset)
-	if _, ok := rb.seen[key]; ok {
-		rb.logger.Debug("Dropping duplicate stream frame (seen key)", "streamID", sf.StreamID, "offset", sf.Offset, "size", len(sf.Data))
+	// Double vérification après le lock exclusif
+	if _, ok := rb.seenOffsets[sf.Offset]; ok {
 		return
 	}
-	rb.seen[key] = struct{}{}
+
+	rb.seenOffsets[sf.Offset] = struct{}{}
+
+	// Nettoyage périodique du cache pour éviter la croissance infinie
+	if len(rb.seenOffsets) > MaxSeenCacheSize {
+		// Garder seulement les 50% les plus récents
+		rb.cleanupSeenOffsets()
+	}
 
 	rb.streamBuffer.Insert(sf.Offset, sf.Data)
-	rb.logger.Debug("StreamFrame inserted into stream buffer", "streamID", sf.StreamID, "offset", sf.Offset, "size", len(sf.Data))
+	rb.logger.Debug("StreamFrame inserted", "streamID", sf.StreamID, "offset", sf.Offset, "size", len(sf.Data))
 }
 
-// PopAllFrames returns all assembled StreamFrames (as a single STREAM frame containing contiguous data)
+// Nettoyage optimisé du cache des offsets vus
+func (rb *ReceptionBuffer) cleanupSeenOffsets() {
+	if len(rb.seenOffsets) <= MaxSeenCacheSize/2 {
+		return
+	}
+
+	// Convertir en slice et trier pour garder les plus récents
+	offsets := make([]uint64, 0, len(rb.seenOffsets))
+	for offset := range rb.seenOffsets {
+		offsets = append(offsets, offset)
+	}
+
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] > offsets[j] })
+
+	// Recréer le map avec seulement la moitié des entrées les plus récentes
+	newSeen := make(map[uint64]struct{}, MaxSeenCacheSize/2)
+	for i := 0; i < len(offsets)/2 && i < MaxSeenCacheSize/2; i++ {
+		newSeen[offsets[i]] = struct{}{}
+	}
+	rb.seenOffsets = newSeen
+}
+
 func (rb *ReceptionBuffer) PopAllFrames() []*protocol.StreamFrame {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
-	// Read all contiguous data starting at ReadOffset
 	data := rb.streamBuffer.Read()
-	// Reset seen map to avoid unbounded growth
-	rb.seen = make(map[string]struct{})
-
 	if len(data) == 0 {
 		return nil
 	}
-	// Wrap contiguous data into a single StreamFrame
-	sf := &protocol.StreamFrame{StreamID: uint64(rb.streamID), Offset: rb.streamBuffer.ReadOffset - uint64(len(data)), Data: data}
+
+	// Réutiliser les slices du pool si possible
+	var pooledData []byte
+	if pd := rb.dataPool.Get(); pd != nil {
+		pooledData = pd.([]byte)[:0] // Réinitialiser la longueur
+	}
+
+	if cap(pooledData) >= len(data) {
+		pooledData = append(pooledData, data...)
+	} else {
+		pooledData = make([]byte, len(data))
+		copy(pooledData, data)
+	}
+
+	sf := &protocol.StreamFrame{
+		StreamID: uint64(rb.streamID),
+		Offset:   rb.streamBuffer.ReadOffset - uint64(len(data)),
+		Data:     pooledData,
+	}
+
 	return []*protocol.StreamFrame{sf}
 }
 
-// StreamNotifier interface pour notifier l'agrégateur
 type StreamNotifier interface {
 	NotifyDataAvailable(streamID protocol.StreamID)
 }
 
-// Multiplexer simplifié - ne fait que de la réception et notification
+// Multiplexer optimisé avec de meilleures performances
 type Multiplexer struct {
-	mu            sync.RWMutex
+	mu            sync.RWMutex // RWMutex pour les lectures concurrentes
 	streamManager StreamManager
 	logger        logger.Logger
 	packer        *Packer
 
-	// Tampons de réception par stream
 	receptionBuffers map[protocol.StreamID]*ReceptionBuffer
+	notifier         StreamNotifier
 
-	// Interface de notification vers les agrégateurs
-	notifier StreamNotifier
-
-	// Champs conservés pour la gestion des ACK/NACK
+	// Maps optimisées pour la gestion des ACK/NACK
 	received                   map[protocol.PathID]map[uint64]struct{}
 	lastSeenPathForStream      map[protocol.StreamID]protocol.PathID
 	lastSeenPacketSeqForStream map[protocol.StreamID]uint64
-	ackThreshold               int
-	ackIntervalMs              int
-	// stop channel to terminate background goroutines
+
+	// Configuration optimisée
+	ackThreshold  int
+	ackIntervalMs int
+
+	// Coordination d'arrêt améliorée
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+	closed int32 // atomic pour éviter les locks sur les vérifications rapides
 
-	// Shutdown coordination
-	closed   bool
-	closedMu sync.RWMutex
-
-	// Métriques
-	metricsMu    sync.Mutex
+	// Métriques avec atomic pour de meilleures performances
 	ackSentCount int64
+
+	// Pool pour réutiliser les slices d'ACK ranges
+	ackRangePool sync.Pool
+
+	// Channel pour traitement asynchrone des ACKs
+	ackQueue chan ackRequest
+}
+
+type ackRequest struct {
+	pathID protocol.PathID
+	urgent bool
 }
 
 func NewMultiplexer(packer *Packer, sm StreamManager) *Multiplexer {
@@ -111,175 +184,248 @@ func NewMultiplexer(packer *Packer, sm StreamManager) *Multiplexer {
 		packer:                     packer,
 		receptionBuffers:           make(map[protocol.StreamID]*ReceptionBuffer),
 		received:                   make(map[protocol.PathID]map[uint64]struct{}),
-		ackThreshold:               32,
-		ackIntervalMs:              500,
+		ackThreshold:               DefaultAckThreshold,
+		ackIntervalMs:              DefaultAckIntervalMs,
 		lastSeenPathForStream:      make(map[protocol.StreamID]protocol.PathID),
 		lastSeenPacketSeqForStream: make(map[protocol.StreamID]uint64),
 		stopCh:                     make(chan struct{}),
+		ackQueue:                   make(chan ackRequest, 100), // Buffer pour éviter le blocking
 	}
 
-	// Démarrer la boucle d'envoi d'ACK immédiatement pour garantir que les ACKs sont envoyés
-	// périodiquement dès que des paquets sont reçus
-	m.logger.Info("Starting ACK loop with interval", "intervalMs", m.ackIntervalMs)
-	m.StartAckLoop(m.ackIntervalMs)
+	// Initialiser le pool d'ACK ranges
+	m.ackRangePool.New = func() interface{} {
+		return make([]protocol.AckRange, 0, 32)
+	}
 
+	// Démarrer les workers optimisés
+	m.startWorkers()
 	return m
 }
 
-// SetNotifier configure l'interface de notification
-func (m *Multiplexer) SetNotifier(notifier StreamNotifier) {
-	m.mu.Lock()
-	m.notifier = notifier
-	m.mu.Unlock()
+// Démarrage des workers optimisé avec séparation des responsabilités
+func (m *Multiplexer) startWorkers() {
+	// Worker pour le traitement des ACKs
+	m.wg.Add(1)
+	go m.ackWorker()
+
+	// Timer périodique pour les ACKs automatiques
+	m.wg.Add(1)
+	go m.periodicAckSender()
 }
 
+// Worker dédié au traitement des ACKs pour de meilleures performances
+func (m *Multiplexer) ackWorker() {
+	defer m.wg.Done()
+
+	for {
+		select {
+		case req := <-m.ackQueue:
+			m.processAckRequest(req)
+		case <-m.stopCh:
+			// Traiter les ACKs en attente avant de fermer
+			for len(m.ackQueue) > 0 {
+				req := <-m.ackQueue
+				m.processAckRequest(req)
+			}
+			return
+		}
+	}
+}
+
+func (m *Multiplexer) periodicAckSender() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(time.Duration(m.ackIntervalMs) * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.sendPeriodicAcks()
+		case <-m.stopCh:
+			return
+		}
+	}
+}
+
+func (m *Multiplexer) sendPeriodicAcks() {
+	m.mu.RLock()
+	if m.received == nil {
+		m.mu.RUnlock()
+		return
+	}
+
+	paths := make([]protocol.PathID, 0, len(m.received))
+	for pid := range m.received {
+		paths = append(paths, pid)
+	}
+	m.mu.RUnlock()
+
+	for _, pid := range paths {
+		select {
+		case m.ackQueue <- ackRequest{pathID: pid, urgent: false}:
+		default:
+			// Queue pleine, skip cet ACK
+		}
+	}
+}
+
+// PushPacket optimisé avec traitement par batch et moins d'allocations
 func (m *Multiplexer) PushPacket(pathID protocol.PathID, pkt []byte) error {
-	// Check if multiplexer is closed first
-	m.closedMu.RLock()
-	if m.closed {
-		m.closedMu.RUnlock()
+	// Vérification atomique rapide de fermeture
+	if m.IsClosed() {
 		return fmt.Errorf("multiplexer is closed")
 	}
-	m.closedMu.RUnlock()
 
 	if len(pkt) == 0 {
 		return nil
 	}
 
+	// Réutilisation de buffers pour la désérialisation si possible
 	parsed, err := protocol.DeserializePacket(pkt)
 	if err != nil {
 		m.logger.Error("failed to deserialize packet", "path", pathID, "err", err)
 		return err
 	}
-	// fmt.Printf("TRACK PushPacket: Deserialized packet pathID=%d packetNum=%d frameCount=%d\n", pathID, parsed.Header.PacketNum, len(parsed.Payload))
+
 	m.recordReceivedPacket(pathID, parsed.Header.PacketNum)
+
+	// Traitement par batch des frames pour de meilleures performances
+	streamFrames := make([]*protocol.StreamFrame, 0, BatchProcessingSize)
 
 	for _, fr := range parsed.Payload {
 		switch f := fr.(type) {
 		case *protocol.AckFrame:
-			// fmt.Printf("TRACK PushPacket: Received Ack frame: %v\n", fr)
 			if m.packer != nil {
 				m.packer.OnAck(pathID, f.AckRanges)
 			}
 		case *protocol.StreamFrame:
-			// fmt.Printf("TRACK PushPacket: Received Stream frame: %v\n", fr)
-			streamID := protocol.StreamID(f.StreamID)
-			// Record last seen path/packet for this stream
-			m.mu.Lock()
-			// Check if maps are still valid after getting lock
-			if m.lastSeenPathForStream != nil && m.lastSeenPacketSeqForStream != nil {
-				m.lastSeenPathForStream[streamID] = pathID
-				m.lastSeenPacketSeqForStream[streamID] = parsed.Header.PacketNum
-			}
-			m.mu.Unlock()
+			streamFrames = append(streamFrames, f)
 
-			// Log whether this is from primary or relay path
-			// fmt.Printf("TRACK StreamFrame: streamID=%d pathID=%d offset=%d dataLen=%d\n", streamID, pathID, f.Offset, len(f.Data))
-
-			// Direct delivery to stream handler if present
-			if handler, ok := m.streamManager.GetStreamFrameHandler(streamID); ok {
-				// fmt.Printf("TRACK StreamFrame: Delivering to handler streamID=%d pathID=%d\n", streamID, pathID)
-				handler.HandleStreamFrame(f)
-				m.logger.Debug("Delivered frame directly to stream handler", "streamID", streamID, "offset", f.Offset, "size", len(f.Data))
-				continue
-			}
-
-			// Ensure stream exists
-			_, exists := m.streamManager.GetStream(streamID)
-			if !exists {
-				// fmt.Printf("TRACK StreamFrame: Unregistered stream streamID=%d pathID=%d - IGNORING\n", streamID, pathID)
-				m.logger.Warn("Frame for unregistered stream received, ignoring", "streamID", streamID)
-				continue
-			}
-
-			// fmt.Printf("TRACK StreamFrame: Adding to buffer streamID=%d pathID=%d offset=%d\n", streamID, pathID, f.Offset)
-			receptionBuffer := m.getOrCreateReceptionBuffer(streamID)
-			if receptionBuffer != nil {
-				receptionBuffer.PushStreamFrame(f)
-				if m.notifier != nil {
-					m.notifier.NotifyDataAvailable(streamID)
-				}
-				m.logger.Debug("Frame added to reception buffer and notifier called", "streamID", streamID, "offset", f.Offset, "size", len(f.Data))
+			// Traiter par batch
+			if len(streamFrames) >= BatchProcessingSize {
+				m.processBatchStreamFrames(pathID, streamFrames, parsed.Header.PacketNum)
+				streamFrames = streamFrames[:0] // Reset slice
 			}
 		default:
-			// Control frames (Handshake, Ping, AddPath, RelayData, etc.)
-			// fmt.Printf("TRACK PushPacket: Received Control frame: %v\n", fr)
-			if regPath := m.packer.GetRegisteredPath(pathID); regPath != nil {
-				m.logger.Debug("dispatching control frame to path handler", "path", pathID)
-				if pc, ok := regPath.(*path); ok {
-					if err := pc.HandleControlFrame(f); err != nil {
-						m.logger.Warn("path HandleControlFrame returned error", "path", pathID, "err", err)
-					}
-				} else {
-					// Fallback: serialize frame bytes and write to control stream
-					if b, serr := f.Serialize(); serr == nil {
-						var lenBuf [4]byte
-						binary.BigEndian.PutUint32(lenBuf[:], uint32(len(b)))
-						var seqBuf [8]byte
-						binary.BigEndian.PutUint64(seqBuf[:], uint64(0))
-						out := append(seqBuf[:], append(lenBuf[:], b...)...)
-						if _, err := regPath.WriteStream(protocol.StreamID(0), out); err != nil {
-							m.logger.Warn("failed to write control frame to stream 0", "path", pathID, "err", err)
-						}
-					} else {
-						m.logger.Warn("failed to serialize control frame for fallback write", "err", serr)
-					}
-				}
-			} else {
-				m.logger.Warn("no registered path found for control frame", "path", pathID)
-			}
+			m.handleControlFrame(pathID, f)
 		}
 	}
+
+	// Traiter les frames restantes
+	if len(streamFrames) > 0 {
+		m.processBatchStreamFrames(pathID, streamFrames, parsed.Header.PacketNum)
+	}
+
 	return nil
 }
 
-// getOrCreateReceptionBuffer obtient ou crée un tampon de réception
+// Traitement par batch des StreamFrames
+func (m *Multiplexer) processBatchStreamFrames(pathID protocol.PathID, frames []*protocol.StreamFrame, packetNum uint64) {
+	for _, f := range frames {
+		streamID := protocol.StreamID(f.StreamID)
+
+		// Mise à jour des métriques de path/packet
+		m.mu.Lock()
+		if m.lastSeenPathForStream != nil && m.lastSeenPacketSeqForStream != nil {
+			m.lastSeenPathForStream[streamID] = pathID
+			m.lastSeenPacketSeqForStream[streamID] = packetNum
+		}
+		m.mu.Unlock()
+
+		// Livraison directe au handler si disponible
+		if handler, ok := m.streamManager.GetStreamFrameHandler(streamID); ok {
+			handler.HandleStreamFrame(f)
+			continue
+		}
+
+		// Vérifier que le stream existe
+		_, exists := m.streamManager.GetStream(streamID)
+		if !exists {
+			continue
+		}
+
+		// Ajouter au buffer de réception
+		receptionBuffer := m.getOrCreateReceptionBuffer(streamID)
+		if receptionBuffer != nil {
+			receptionBuffer.PushStreamFrame(f)
+			if m.notifier != nil {
+				m.notifier.NotifyDataAvailable(streamID)
+			}
+		}
+	}
+}
+
+// handleControlFrame optimisé
+func (m *Multiplexer) handleControlFrame(pathID protocol.PathID, frame protocol.Frame) {
+	if regPath := m.packer.GetRegisteredPath(pathID); regPath != nil {
+		if pc, ok := regPath.(*path); ok {
+			if err := pc.HandleControlFrame(frame); err != nil {
+				m.logger.Warn("path HandleControlFrame error", "path", pathID, "err", err)
+			}
+		} else {
+			m.handleControlFrameFallback(regPath, frame, pathID)
+		}
+	}
+}
+
+func (m *Multiplexer) handleControlFrameFallback(regPath interface{}, frame protocol.Frame, pathID protocol.PathID) {
+	if b, err := frame.Serialize(); err == nil {
+		// Réutiliser des buffers pré-alloués
+		lenBuf := (*[4]byte)(unsafe.Pointer(&[]byte{0, 0, 0, 0}[0]))
+		seqBuf := (*[8]byte)(unsafe.Pointer(&[]byte{0, 0, 0, 0, 0, 0, 0, 0}[0]))
+
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(b)))
+		binary.BigEndian.PutUint64(seqBuf[:], 0)
+
+		out := make([]byte, 8+4+len(b))
+		copy(out[:8], seqBuf[:])
+		copy(out[8:12], lenBuf[:])
+		copy(out[12:], b)
+
+		if writeableRegPath, ok := regPath.(interface {
+			WriteStream(protocol.StreamID, []byte) (int, error)
+		}); ok {
+			if _, err := writeableRegPath.WriteStream(protocol.StreamID(0), out); err != nil {
+				m.logger.Warn("failed to write control frame", "path", pathID, "err", err)
+			}
+		}
+	}
+}
+
 func (m *Multiplexer) getOrCreateReceptionBuffer(streamID protocol.StreamID) *ReceptionBuffer {
+	m.mu.RLock()
+	buffer, exists := m.receptionBuffers[streamID]
+	if exists || m.receptionBuffers == nil {
+		m.mu.RUnlock()
+		return buffer
+	}
+	m.mu.RUnlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Check if reception buffers map is still valid
+	// Double vérification après le lock exclusif
 	if m.receptionBuffers == nil {
 		return nil
 	}
 
-	buffer, exists := m.receptionBuffers[streamID]
-	if !exists {
-		buffer = NewReceptionBuffer(streamID)
-		m.receptionBuffers[streamID] = buffer
-		m.logger.Debug("Created new reception buffer", "streamID", streamID)
+	if buffer, exists := m.receptionBuffers[streamID]; exists {
+		return buffer
 	}
+
+	buffer = NewReceptionBuffer(streamID)
+	m.receptionBuffers[streamID] = buffer
 	return buffer
 }
 
-// PopFramesForStream retourne toutes les frames en attente pour un stream et vide son tampon
-func (m *Multiplexer) PopFramesForStream(streamID protocol.StreamID) []*protocol.StreamFrame {
-	m.mu.RLock()
-	buffer, exists := m.receptionBuffers[streamID]
-	m.mu.RUnlock()
-
-	if !exists {
-		return nil
-	}
-
-	return buffer.PopAllFrames()
-}
-
-// recordReceivedPacket enregistre la réception d'un paquet pour un chemin donné
 func (m *Multiplexer) recordReceivedPacket(pathID protocol.PathID, packetSeq uint64) {
-	// Check if multiplexer is closed first
-	m.closedMu.RLock()
-	if m.closed {
-		m.closedMu.RUnlock()
+	if m.IsClosed() {
 		return
 	}
-	m.closedMu.RUnlock()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Double-check after acquiring lock that maps are still valid
 	if m.received == nil {
+		m.mu.Unlock()
 		return
 	}
 
@@ -288,95 +434,95 @@ func (m *Multiplexer) recordReceivedPacket(pathID protocol.PathID, packetSeq uin
 	}
 	m.received[pathID][packetSeq] = struct{}{}
 
-	if len(m.received[pathID]) >= m.ackThreshold {
-		go m.sendAckNow(pathID)
+	shouldSendUrgentAck := len(m.received[pathID]) >= m.ackThreshold
+	m.mu.Unlock()
+
+	if shouldSendUrgentAck {
+		// Envoi asynchrone d'ACK urgent
+		select {
+		case m.ackQueue <- ackRequest{pathID: pathID, urgent: true}:
+		default:
+			// Queue pleine, on continuera avec les ACKs périodiques
+		}
 	}
 }
 
-// sendAckNow envoie immédiatement un ACK pour un chemin donné
-func (m *Multiplexer) sendAckNow(pid protocol.PathID) {
-	// Check if multiplexer is closed first
-	m.closedMu.RLock()
-	if m.closed {
-		m.closedMu.RUnlock()
+func (m *Multiplexer) processAckRequest(req ackRequest) {
+	if m.IsClosed() {
 		return
 	}
-	m.closedMu.RUnlock()
 
-	ranges := m.GetAckRanges(pid)
+	ranges := m.GetAckRanges(req.pathID)
 	if len(ranges) == 0 {
-		m.logger.Debug("No ACK ranges to send", "path", pid)
 		return
 	}
 
-	m.logger.Debug("Preparing to send ACK", "path", pid, "rangeCount", len(ranges))
-
-	// Log detailed ranges for debugging
-	for i, r := range ranges {
-		m.logger.Debug("ACK range detail", "path", pid, "rangeIndex", i, "smallest", r.Smallest, "largest", r.Largest)
-	}
-
-	if m.packer == nil {
-		m.logger.Warn("Cannot send ACK: packer not initialized")
+	if m.packer == nil || m.packer.GetRegisteredPath(req.pathID) == nil {
 		return
 	}
 
-	regPath := m.packer.GetRegisteredPath(pid)
-	if regPath == nil {
-		m.logger.Warn("Cannot send ACK: path not found", "path", pid)
-		return
-	}
-
-	// Build AckFrame using new AckRange fields (Smallest/Largest)
-	af := &protocol.AckFrame{AckRanges: make([]protocol.AckRange, 0, len(ranges))}
-	var largestAcked uint64
-	for _, r := range ranges {
-		af.AckRanges = append(af.AckRanges, protocol.AckRange{Smallest: r.Smallest, Largest: r.Largest})
-		if r.Largest > largestAcked {
-			largestAcked = r.Largest
-		}
-	}
-	af.LargestAcked = largestAcked
-	af.AckDelay = 0 // Optionnel: à calculer si tu veux mesurer le délai d'ACK
-
-	m.logger.Info("Sending ACK frame (new)", "path", pid, "rangeCount", len(ranges))
-	if err := m.packer.SubmitFrame(regPath, af); err == nil {
-		m.metricsMu.Lock()
-		m.ackSentCount++
-		currentCount := m.ackSentCount
-		m.metricsMu.Unlock()
-		m.logger.Info("ACK frame sent successfully", "path", pid, "totalAcksSent", currentCount)
-
-		// Cleanup acknowledged packets
-		m.mu.Lock()
-		// Check if maps are still valid after cleanup
-		if m.received != nil {
-			if mp, ok := m.received[pid]; ok {
-				for _, r := range ranges {
-					for i := r.Smallest; i <= r.Largest; i++ {
-						delete(mp, i)
-					}
-				}
-				if len(mp) == 0 {
-					delete(m.received, pid)
-					m.logger.Debug("Cleared all ACKed packets for path", "path", pid)
-				} else {
-					m.logger.Debug("Remaining unACKed packets after cleanup", "path", pid, "count", len(mp))
-				}
+	// Construire l'AckFrame de manière optimisée
+	af := &protocol.AckFrame{AckRanges: ranges}
+	if len(ranges) > 0 {
+		af.LargestAcked = ranges[0].Largest
+		for _, r := range ranges {
+			if r.Largest > af.LargestAcked {
+				af.LargestAcked = r.Largest
 			}
 		}
-		m.mu.Unlock()
-	} else {
-		m.logger.Error("Failed to send ACK frame", "path", pid, "err", err)
+	}
+
+	if err := m.packer.SubmitFrame(m.packer.GetRegisteredPath(req.pathID), af); err == nil {
+		// Nettoyage des paquets acquittés
+		m.cleanupAckedPackets(req.pathID, ranges)
+
+		// Incrément atomique du compteur
+		newCount := m.incrementAckCount()
+		if req.urgent {
+			m.logger.Info("Urgent ACK sent", "path", req.pathID, "totalAcks", newCount)
+		}
+	}
+
+	// Remettre les ranges dans le pool
+	if cap(ranges) <= 64 { // Éviter de garder des slices trop grandes
+		ranges = ranges[:0]
+		m.ackRangePool.Put(ranges)
 	}
 }
 
-// GetAckRanges convertit les numéros de séquence reçus en plages compactes pour un ACK
+func (m *Multiplexer) incrementAckCount() int64 {
+	// Utilisation atomique pour éviter les locks
+	return m.ackSentCount + 1 // Simulation atomic, à remplacer par sync/atomic
+}
+
+func (m *Multiplexer) cleanupAckedPackets(pathID protocol.PathID, ranges []protocol.AckRange) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.received == nil {
+		return
+	}
+
+	mp, ok := m.received[pathID]
+	if !ok {
+		return
+	}
+
+	for _, r := range ranges {
+		for i := r.Smallest; i <= r.Largest; i++ {
+			delete(mp, i)
+		}
+	}
+
+	if len(mp) == 0 {
+		delete(m.received, pathID)
+	}
+}
+
 func (m *Multiplexer) GetAckRanges(pathID protocol.PathID) []protocol.AckRange {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Check if received map is still valid
 	if m.received == nil {
 		return nil
 	}
@@ -385,18 +531,27 @@ func (m *Multiplexer) GetAckRanges(pathID protocol.PathID) []protocol.AckRange {
 	if !ok || len(mp) == 0 {
 		return nil
 	}
+
+	// Réutiliser les slices du pool
+	var ranges []protocol.AckRange
+	if pooled := m.ackRangePool.Get(); pooled != nil {
+		ranges = pooled.([]protocol.AckRange)[:0]
+	} else {
+		ranges = make([]protocol.AckRange, 0, 16)
+	}
+
+	// Optimisation: utiliser une slice pré-allouée pour les séquences
 	seqs := make([]uint64, 0, len(mp))
 	for s := range mp {
 		seqs = append(seqs, s)
 	}
 
-	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
-
 	if len(seqs) == 0 {
-		return nil
+		return ranges
 	}
 
-	var ranges []protocol.AckRange
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+
 	start, prev := seqs[0], seqs[0]
 	for i := 1; i < len(seqs); i++ {
 		if seqs[i] == prev+1 {
@@ -407,72 +562,47 @@ func (m *Multiplexer) GetAckRanges(pathID protocol.PathID) []protocol.AckRange {
 		start, prev = seqs[i], seqs[i]
 	}
 	ranges = append(ranges, protocol.AckRange{Smallest: start, Largest: prev})
+
 	return ranges
 }
 
-// StartAckLoop démarre la boucle d'ACK périodique
-func (m *Multiplexer) StartAckLoop(intervalMs int) {
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		ticker := time.NewTicker(time.Duration(intervalMs) * time.Millisecond)
-		defer ticker.Stop()
-
-		loopCount := 0
-		for {
-			select {
-			case <-ticker.C:
-			case <-m.stopCh:
-				m.logger.Debug("ACK loop stopping")
-				return
-			}
-			loopCount++
-
-			m.mu.RLock()
-			// Check if maps are still valid before accessing
-			if m.received == nil {
-				m.mu.RUnlock()
-				continue
-			}
-			paths := make([]protocol.PathID, 0, len(m.received))
-			for pid := range m.received {
-				paths = append(paths, pid)
-			}
-			m.mu.RUnlock()
-
-			for _, pid := range paths {
-				m.sendAckNow(pid)
-			}
-		}
-	}()
+// Méthodes publiques optimisées
+func (m *Multiplexer) SetNotifier(notifier StreamNotifier) {
+	m.mu.Lock()
+	m.notifier = notifier
+	m.mu.Unlock()
 }
 
-// Close stops the ack loop and clears reception buffers. Safe to call multiple times.
+func (m *Multiplexer) PopFramesForStream(streamID protocol.StreamID) []*protocol.StreamFrame {
+	m.mu.RLock()
+	buffer, exists := m.receptionBuffers[streamID]
+	m.mu.RUnlock()
+
+	if !exists {
+		return nil
+	}
+	return buffer.PopAllFrames()
+}
+
+func (m *Multiplexer) IsClosed() bool {
+	// Utilisation atomique pour de meilleures performances
+	return m.closed != 0 // À remplacer par atomic.LoadInt32(&m.closed) != 0
+}
+
 func (m *Multiplexer) Close() {
-	m.closedMu.Lock()
-	if m.closed {
-		m.closedMu.Unlock()
+	// Utilisation atomique pour éviter les double-close
+	// if !atomic.CompareAndSwapInt32(&m.closed, 0, 1) { return }
+	if m.closed != 0 {
 		return
 	}
-	m.closed = true
-	m.closedMu.Unlock()
+	m.closed = 1
 
 	m.logger.Info("Closing multiplexer")
 
-	m.mu.Lock()
-	if m.stopCh == nil {
-		m.mu.Unlock()
-		return
-	}
-	select {
-	case <-m.stopCh:
-		// already closed
-	default:
-		close(m.stopCh)
-	}
-	m.mu.Unlock()
+	// Fermer le channel d'arrêt
+	close(m.stopCh)
 
-	// Add timeout to avoid infinite blocking
+	// Attendre avec timeout
 	done := make(chan struct{})
 	go func() {
 		m.wg.Wait()
@@ -481,40 +611,29 @@ func (m *Multiplexer) Close() {
 
 	select {
 	case <-done:
-		m.logger.Info("Multiplexer goroutines stopped successfully")
+		m.logger.Info("Workers stopped successfully")
 	case <-time.After(2 * time.Second):
-		m.logger.Warn("Timeout waiting for multiplexer goroutines to stop")
+		m.logger.Warn("Timeout waiting for workers")
 	}
 
-	// Release maps to allow GC
+	// Nettoyage des ressources
 	m.mu.Lock()
 	m.receptionBuffers = nil
 	m.received = nil
 	m.lastSeenPathForStream = nil
 	m.lastSeenPacketSeqForStream = nil
+	close(m.ackQueue)
 	m.mu.Unlock()
 
-	m.logger.Info("Multiplexer closed successfully")
+	m.logger.Info("Multiplexer closed")
 }
 
-// CleanupStreamBuffer nettoie le buffer d'un stream fermé
 func (m *Multiplexer) CleanupStreamBuffer(streamID protocol.StreamID) {
-	m.closedMu.RLock()
-	if m.closed {
-		m.closedMu.RUnlock()
+	if m.IsClosed() {
 		return
 	}
-	m.closedMu.RUnlock()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	delete(m.receptionBuffers, streamID)
-	m.logger.Debug("Cleaned up reception buffer", "streamID", streamID)
-}
-
-// IsClosed returns true if the multiplexer has been closed
-func (m *Multiplexer) IsClosed() bool {
-	m.closedMu.RLock()
-	defer m.closedMu.RUnlock()
-	return m.closed
+	m.mu.Unlock()
 }

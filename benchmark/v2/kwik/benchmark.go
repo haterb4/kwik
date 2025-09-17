@@ -189,6 +189,12 @@ func main() {
 		runner.results = append(runner.results, *result)
 		runner.mutex.Unlock()
 
+		// Pause plus longue entre les scénarios pour libération des ressources
+		if i < len(scenarios)-1 { // Pas de pause après le dernier scénario
+			fmt.Printf("⏳ Attente de libération des ressources avant le prochain scénario...\n")
+			time.Sleep(2 * time.Second) // Pause de 2 secondes entre scénarios
+		}
+
 		fmt.Printf("✅ Scénario %s terminé - RPS: %.2f, Latence moy: %v\n",
 			scenario.Name, result.RequestsPerSecond, result.AverageLatency)
 		fmt.Println()
@@ -339,6 +345,7 @@ func (br *BenchmarkRunner) runClient(clientID int, serverAddr string, config Ben
 			log.Printf("Client %d: erreur connexion: %v", clientID, err)
 			return
 		}
+		log.Printf("Client %d: connecté à %s connection %d/%d\n", clientID, serverAddr, i+1, poolSize)
 		connections = append(connections, conn)
 	}
 

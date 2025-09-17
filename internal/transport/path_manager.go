@@ -63,13 +63,16 @@ func (pm *pathManagerImpl) OpenPath(ctx context.Context, address string, session
 	}
 	// mark outbound dialed paths as client-side
 	path := NewPath(nextPathID, conn, true, session)
+	if path == nil {
+		return 0, fmt.Errorf("failed to create client path")
+	}
 
 	pm.paths[nextPathID] = path
 	pm.logger.Debug("Created client path", "pathID", nextPathID, "address", address)
 	return nextPathID, nil
 }
 
-func (pm *pathManagerImpl) AccpetPath(conn *quic.Conn, session Session) (protocol.PathID, error) {
+func (pm *pathManagerImpl) AcceptPath(conn *quic.Conn, session Session) (protocol.PathID, error) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -79,6 +82,9 @@ func (pm *pathManagerImpl) AccpetPath(conn *quic.Conn, session Session) (protoco
 	}
 	// mark accepted paths as server-side (isClient=false)
 	path := NewPath(nextPathID, conn, false, session)
+	if path == nil {
+		return 0, fmt.Errorf("failed to create server path")
+	}
 	pm.paths[nextPathID] = path
 	pm.logger.Debug("Accepted server path", "pathID", nextPathID, "remoteAddr", conn.RemoteAddr().String())
 	return nextPathID, nil
@@ -116,7 +122,27 @@ func (pm *pathManagerImpl) GetPath(id protocol.PathID) Path {
 func (pm *pathManagerImpl) RemovePath(id protocol.PathID) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	// Vérifier si on supprime le primary path
+	wasPrimary := (pm.primaryPathID == id)
+
+	// Supprimer le path
 	delete(pm.paths, id)
+	pm.logger.Debug("Path removed", "pathID", id, "wasPrimary", wasPrimary)
+
+	// Si c'était le primary path, choisir un nouveau primary parmi les paths restants
+	if wasPrimary && len(pm.paths) > 0 {
+		// Prendre le premier path disponible comme nouveau primary
+		for newPrimaryID := range pm.paths {
+			pm.primaryPathID = newPrimaryID
+			pm.logger.Info("New primary path selected", "pathID", newPrimaryID)
+			break
+		}
+	} else if wasPrimary && len(pm.paths) == 0 {
+		// Plus aucun path, réinitialiser
+		pm.primaryPathID = 0
+		pm.logger.Info("No paths remaining, primary path reset")
+	}
 }
 
 func (pm *pathManagerImpl) CloseAllPaths() error {
@@ -227,4 +253,17 @@ func (pm *pathManagerImpl) handleAddPathResp(frame *protocol.AddPathRespFrame) {
 	default:
 		pm.logger.Warn("AddPathResp handler channel is full")
 	}
+}
+
+// GetActivePathIDs retourne la liste des IDs des paths actifs
+func (pm *pathManagerImpl) GetActivePathIDs() []protocol.PathID {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	pathIDs := make([]protocol.PathID, 0, len(pm.paths))
+	for pathID := range pm.paths {
+		pathIDs = append(pathIDs, pathID)
+	}
+
+	return pathIDs
 }

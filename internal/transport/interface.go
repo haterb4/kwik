@@ -33,6 +33,7 @@ type StreamManager interface {
 	GetStream(streamID protocol.StreamID) (Stream, bool)
 	AddPathToStream(streamID protocol.StreamID, path Path) error
 	CloseStream(streamID protocol.StreamID) error
+	CloseAllStreams()
 	// GetStreamFrameHandler returns an optional handler that can accept direct StreamFrame delivery
 	GetStreamFrameHandler(streamID protocol.StreamID) (StreamFrameHandler, bool)
 	// GetSendStreamProvider returns an optional provider that can supply frames for sending
@@ -58,6 +59,7 @@ type sessionInternal interface {
 	Multiplexer() *Multiplexer
 	PathManager() PathManager
 	StreamManager() StreamManager
+	HandlePathFailure(pathID protocol.PathID, fatalErr error) // Nouvelle méthode pour gérer la mort des paths
 }
 
 // SessionState represents the current state of a session
@@ -65,11 +67,28 @@ type SessionState int
 
 const (
 	SessionStateConnecting SessionState = iota
-	SessionStateAuthenticating
-	SessionStateAuthenticated
+	SessionStateInitializing
 	SessionStateActive
+	SessionStateClosing
 	SessionStateClosed
 )
+
+func (s SessionState) String() string {
+	switch s {
+	case SessionStateConnecting:
+		return "connecting"
+	case SessionStateInitializing:
+		return "initializing"
+	case SessionStateActive:
+		return "active"
+	case SessionStateClosing:
+		return "closing"
+	case SessionStateClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
 
 // Session represents a KWIK session
 type Session interface {
@@ -111,6 +130,7 @@ type Path interface {
 	RemoteAddr() string
 	RemoveStream(streamID protocol.StreamID)
 	PathID() protocol.PathID
+	State() PathState
 	// IsClient returns true when the path was created by an active dial (client side)
 	IsClient() bool
 	// IsSessionReady reports whether the per-path session handshake completed
@@ -140,7 +160,7 @@ type Relay interface {
 
 type PathManager interface {
 	OpenPath(ctx context.Context, addr string, session Session) (protocol.PathID, error)
-	AccpetPath(conn *quic.Conn, session Session) (protocol.PathID, error)
+	AcceptPath(conn *quic.Conn, session Session) (protocol.PathID, error)
 	SetPrimaryPath(id protocol.PathID)
 	AddRelay(address string) (Relay, error)
 	// ListPaths() []Path
@@ -148,4 +168,5 @@ type PathManager interface {
 	GetPath(id protocol.PathID) Path
 	RemovePath(id protocol.PathID)
 	CloseAllPaths() error
+	GetActivePathIDs() []protocol.PathID // Nouvelle méthode pour lister les paths actifs
 }

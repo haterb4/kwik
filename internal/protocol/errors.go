@@ -73,3 +73,11 @@ const (
 func NewFrameTooLargeError(frameSize, maxSize int) error {
 	return NewKwikError(ErrFrameTooLarge, fmt.Sprintf("frame too large for maxPacketSize: %d > %d", frameSize, maxSize), nil)
 }
+
+const (
+	ErrInvalidSessionID = "KWIK_INVALID_SESSION_ID"
+)
+
+func NewInvalidSessionIDError(sessionID SessionID) error {
+	return NewKwikError(ErrInvalidSessionID, fmt.Sprintf("invalid session ID: %d", sessionID), nil)
+}
